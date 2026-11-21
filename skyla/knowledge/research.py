@@ -1,9 +1,8 @@
-"""Live web research — fetch + extract text from permitted public sources.
+"""Live web research — SSRF-guarded fetch (v0.3.0, audit finding A-08).
 
-Only http(s) URLs are fetched; responses are size-capped; fetched content is
-treated as untrusted (injection-scanned) and stored with provenance.
-Search-engine scraping is intentionally NOT implemented (ToS/legality);
-use official search APIs or direct URLs.
+Every hop is validated through `netguard.validate_url`, resolution happens at the
+connection boundary, and redirects are followed manually so each target is
+re-vetted before the request is made.
 """
 from __future__ import annotations
 
@@ -12,29 +11,55 @@ import re
 import httpx
 
 from ..config import get_settings
-from ..security import scan_untrusted
+from ..netguard import SSRFBlocked, validate_url
+from ..trust import Provenance, TrustedText
 
 
 def _extract_text(html: str) -> str:
     html = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-async def fetch_url(url: str) -> dict:
-    if not url.startswith(("http://", "https://")):
-        raise ValueError("Only http(s) URLs are permitted")
+async def fetch_url(url: str, max_redirects: int = 3) -> dict:
+    """Fetch a public http(s) URL with SSRF protection on every hop.
+
+    Fetched content is returned as UNTRUSTED web provenance: it can be read,
+    summarized and quoted, but never authorizes an action.
+    """
     s = get_settings()
-    async with httpx.AsyncClient(timeout=s.research_timeout_s,
-                                 headers={"User-Agent": s.research_user_agent},
-                                 follow_redirects=True) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        raw = resp.content[: s.research_max_bytes]
+    current = url
+    hops = 0
+    async with httpx.AsyncClient(
+        timeout=s.research_timeout_s,
+        headers={"User-Agent": s.research_user_agent},
+        follow_redirects=False,
+    ) as client:
+        while True:
+            vetted = validate_url(current)          # resolves + vets this hop
+            resp = await client.get(vetted.url)
+            if resp.is_redirect:
+                hops += 1
+                if hops > max_redirects:
+                    raise SSRFBlocked(f"too many redirects (>{max_redirects})")
+                location = resp.headers.get("location", "")
+                from urllib.parse import urljoin
+                current = urljoin(current, location)
+                continue
+            resp.raise_for_status()
+            raw = resp.content[: s.research_max_bytes]
+            break
+
     text = _extract_text(raw.decode("utf-8", errors="ignore"))
+    trusted = TrustedText(text=text[:20000], provenance=Provenance.WEB_CONTENT,
+                          source=vetted.host)
     return {
-        "url": url, "status": resp.status_code, "text": text[:20000],
-        "injection_flags": scan_untrusted(text),
+        "url": vetted.url,
+        "status": resp.status_code,
+        "text": trusted.text,
+        "provenance": int(trusted.provenance),
+        "trust_label": trusted.label,
+        "anomalies": trusted.anomalies,
+        "trusted": trusted.trusted,
         "truncated": len(raw) >= s.research_max_bytes,
     }

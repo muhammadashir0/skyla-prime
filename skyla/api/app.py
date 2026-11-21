@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -17,7 +18,8 @@ from ..auth import AuthService, bootstrap_admin
 from ..config import get_settings
 from ..core.orchestrator import Orchestrator
 from ..core.planner import plan_task
-from ..db import Database
+from ..db import MIGRATIONS, Database
+from ..dbguard import DatabaseIntegrityError, enforce as enforce_db
 from ..execution.providers import get_execution_provider
 from ..integrations.calendar import GoogleCalendarConnector
 from ..integrations.gmail import GmailConnector
@@ -27,12 +29,27 @@ from ..knowledge.store import KnowledgeStore
 from ..models.registry import registry_as_dicts
 from ..models.router import ModelRouter, classify_task, route_candidates
 from ..observability import get_logger, metrics, new_trace_id, redact
+from ..execution.service import CapacityExceeded, governor
 from ..security import check_autonomy, scan_untrusted
+from ..throttle import LoginBlocked, login_throttle
+from ..trust import (AUTHORITY_FLOOR, Provenance, TrustViolation, TrustedText,
+                     require_authority, risk_score)
 from ..workflows.operations import (workflow_inbox, workflow_meeting,
                                     workflow_research, workflow_telegram_command)
 
 log = get_logger("skyla.api")
 settings = get_settings()
+# M5 / A-07: classify the database BEFORE any write. Refuse ambiguous or damaged
+# states instead of silently creating an empty application database.
+try:
+    _db_report = enforce_db(
+        settings.db_path,
+        max_schema_version=max(v for v, _ in MIGRATIONS),
+        allow_init=os.getenv("SKYLA_INIT_DB", "1") != "0",
+    )
+except DatabaseIntegrityError as exc:  # fail closed, loudly, before serving
+    raise RuntimeError(f"SKYLA PRIME refused to start: {exc}") from exc
+
 db = Database(settings.db_path)
 
 
@@ -183,8 +200,15 @@ class TokenCreate(BaseModel):
 
 
 @app.post("/api/auth/login")
-def login(body: LoginRequest):
-    user = auth.authenticate(body.username, body.password, body.mfa_code)
+def login(body: LoginRequest, request: Request):
+    remote = (request.client.host if request.client else "") or ""
+    try:
+        user = auth.authenticate(body.username, body.password, body.mfa_code,
+                                 throttle=login_throttle, remote=remote)
+    except LoginBlocked as exc:
+        db.audit(body.username, "auth.login.blocked", exc.reason)
+        raise HTTPException(429, detail=str(exc),
+                           headers={"Retry-After": str(exc.retry_after_s)}) from exc
     if not user:
         raise HTTPException(401, "Invalid credentials or MFA code")
     token = auth.create_session(user["id"])
@@ -292,17 +316,39 @@ async def create_task(body: TaskCreate, authorization: str | None = Header(None)
         if not auth.has_capability(user, f"agent:{agent_name}:run", scopes):
             raise HTTPException(
                 403, f"Agent '{agent_name}' is not permitted for this identity")
-    flags = scan_untrusted(body.instruction)
+    # M3: the instruction is authenticated user input and therefore has
+    # task:create authority. It is still risk-scored: heavy anomaly counts force
+    # an autonomy downgrade rather than being silently ignored.
+    instruction = TrustedText(body.instruction, Provenance.AUTHENTICATED_USER,
+                              source=user["username"])
+    try:
+        require_authority([instruction], "task:create")
+    except TrustViolation as exc:
+        db.audit(user["username"], "task.denied.trust", str(exc)[:120])
+        raise HTTPException(403, str(exc)) from exc
+    risk = risk_score([instruction])
+    if risk["requires_review"] and body.autonomy_level > 0:
+        db.audit(user["username"], "task.risk.downgrade",
+                 f"score={risk['score']} {risk['anomalies'][:2]}")
+        raise HTTPException(403, {
+            "error": "risk_review_required",
+            "detail": "Instruction scored high risk; re-submit at autonomy_level=0 "
+                      "for a read-only plan, or review the content.",
+            "risk": risk})
+
     tid = db.create_task(body.title or body.instruction[:60],
                          body.instruction, classify_task(body.instruction),
                          body.autonomy_level)
     db.execute("UPDATE tasks SET owner_id=? WHERE id=?", (user["id"], tid))
     if body.idempotency_key:
         db.ledger_complete(body.idempotency_key, "completed", tid)
-    db.audit(user["username"], "task.create", f"{tid} level={body.autonomy_level} flags={flags}",
+    db.audit(user["username"], "task.create", f"{tid} level={body.autonomy_level} anomalies={len(instruction.anomalies)} risk={risk['score']}",
              body.autonomy_level)
     asyncio.create_task(orchestrator.run_task_async(tid))
-    return {"id": tid, "status": "queued", "injection_flags": flags}
+    return {"id": tid, "status": "queued",
+            "trust": {"provenance": int(instruction.provenance),
+                      "label": instruction.label, "anomalies": instruction.anomalies,
+                      "risk": risk}}
 
 
 @app.get("/api/tasks")
@@ -363,7 +409,12 @@ class MemoryCreate(BaseModel):
 @app.post("/api/knowledge/documents")
 def ingest(body: DocumentCreate, authorization: str | None = Header(None)):
     user = _require(authorization, "knowledge:write")
+    document = TrustedText(body.content, Provenance.UPLOADED_DOC,
+                           source=body.source or user["username"])
     doc = knowledge.ingest(body.title, body.content, body.source, "text", body.license)
+    doc["trust"] = {"provenance": int(document.provenance),
+                    "label": document.label, "anomalies": document.anomalies,
+                    "authority": "none (untrusted document)"}
     db.execute("UPDATE documents SET owner_id=? WHERE id=?", (user["id"], doc["id"]))
     db.audit(user["username"], "knowledge.ingest", f"{doc['id']} {body.title}")
     return doc
@@ -381,27 +432,93 @@ def docs(authorization: str | None = Header(None)):
     return [d for d in knowledge.list() if _visible(user, d.get("owner_id"))]
 
 
+# ---------------------------------------------------------------- memory (A-05)
+# Ownership is enforced IN SQL (db._require_tenant + WHERE owner_id=?), never by
+# filtering a general result set. Foreign ids return 404 so existence is private.
+class MemoryCreate(BaseModel):
+    key: str
+    value: str
+    kind: str = "preference"
+    reliability: float = 0.8
+
+
+class MemoryUpdate(BaseModel):
+    value: str
+
+
+def _tenant(user: dict) -> str:
+    """The tenant identity for memory operations. Deny by default."""
+    tid = user.get("id")
+    if not tid:
+        raise HTTPException(403, "No tenant identity on this principal")
+    return tid
+
+
 @app.post("/api/knowledge/memory")
 def remember(body: MemoryCreate, authorization: str | None = Header(None)):
-    user = _require(authorization, "memory:write")
-    mem = knowledge.remember(body.key, body.value, body.kind, "user", body.reliability)
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "memory:write", scopes)
+    tenant = _tenant(user)
+    mem = knowledge.remember(body.key, body.value, owner_id=tenant,
+                             kind=body.kind, source="user",
+                             reliability=body.reliability)
     db.audit(user["username"], "memory.set", f"{body.key}")
     return mem
 
 
 @app.get("/api/knowledge/memory")
-def recall(q: str, authorization: str | None = Header(None)):
-    _require(authorization, "knowledge:read")
-    return knowledge.recall(q)
+def recall(q: str = "", authorization: str | None = Header(None)):
+    """Search or list memories belonging to the caller's tenant only."""
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "knowledge:read", scopes)
+    tenant = _tenant(user)
+    if q:
+        return knowledge.recall(q, owner_id=tenant)
+    return knowledge.list_memories(tenant)
+
+
+@app.get("/api/knowledge/memory/{memory_id}")
+def get_memory(memory_id: str, authorization: str | None = Header(None)):
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "knowledge:read", scopes)
+    mem = knowledge.get_memory(memory_id, owner_id=_tenant(user))
+    if not mem:
+        raise HTTPException(404, "Memory not found")
+    return mem
+
+
+@app.patch("/api/knowledge/memory/{memory_id}")
+def update_memory(memory_id: str, body: MemoryUpdate,
+                  authorization: str | None = Header(None)):
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "memory:write", scopes)
+    if not knowledge.update_memory(memory_id, body.value, owner_id=_tenant(user)):
+        db.audit(user["username"], "memory.update.denied", memory_id)
+        raise HTTPException(404, "Memory not found")
+    db.audit(user["username"], "memory.update", memory_id)
+    return {"updated": memory_id}
 
 
 @app.delete("/api/knowledge/memory/{memory_id}")
 def forget(memory_id: str, authorization: str | None = Header(None)):
-    user = _require(authorization, "memory:write")
-    if not db.delete_memory(memory_id):
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "memory:write", scopes)
+    if not knowledge.forget(memory_id, owner_id=_tenant(user)):
+        db.audit(user["username"], "memory.delete.denied", memory_id)
         raise HTTPException(404, "Memory not found")
     db.audit(user["username"], "memory.delete", memory_id)
     return {"deleted": memory_id}
+
+
+@app.get("/api/knowledge/memory-export")
+def export_memory(authorization: str | None = Header(None)):
+    """Full tenant export. Scoped in SQL; never includes another tenant's rows."""
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "knowledge:read", scopes)
+    tenant = _tenant(user)
+    rows = knowledge.export_memories(tenant)
+    db.audit(user["username"], "memory.export", f"count={len(rows)}")
+    return {"owner_id": tenant, "count": len(rows), "memories": rows}
 
 
 # ---------------------------------------------------------------- execution
@@ -411,16 +528,48 @@ class CodeRun(BaseModel):
 
 
 @app.post("/api/execute/python")
-def execute_python(body: CodeRun, authorization: str | None = Header(None)):
-    user = _require(authorization, "execute")
+def execute_python(body: CodeRun, request: Request,
+                   authorization: str | None = Header(None)):
+    user, scopes = _resolve_user(authorization)
+    _require(authorization, "execute", scopes)
     check_autonomy(2, settings.max_autonomy_level)
-    result = execution.run(body.code, settings.sandbox_timeout_s,
-                           settings.sandbox_memory_mb, network=body.network)
+
+    # M3: code execution must be authorized by a TRUSTED principal context.
+    # The request itself is authentic user input, so it has that authority --
+    # but the gate is explicit and would refuse an untrusted-origin action.
+    try:
+        require_authority([TrustedText(body.code, Provenance.AUTHENTICATED_USER,
+                                       source=user["username"])], "execute:code")
+    except TrustViolation as exc:
+        db.audit(user["username"], "execute.denied.trust", str(exc)[:120])
+        raise HTTPException(403, str(exc)) from exc
+
+    if not execution.isolated or not execution.status().get("available", False):
+        # Fail closed: never run untrusted code on an uncontained provider.
+        db.audit(user["username"], "execute.refused",
+                 f"provider={execution.name} isolated={execution.isolated}")
+        raise HTTPException(503, {
+            "error": "execution_unavailable",
+            "detail": ("No contained execution provider is available. Arbitrary code "
+                       "execution is refused rather than run unisolated."),
+            "provider": execution.status(),
+        })
+
+    try:
+        with governor:
+            memory_mb = governor.clamp_memory(settings.sandbox_memory_mb)
+            result = execution.run(body.code, settings.sandbox_timeout_s,
+                                   memory_mb, network=body.network)
+    except CapacityExceeded as exc:
+        metrics.inc("execution_rejected_capacity")
+        raise HTTPException(429, detail=str(exc),
+                           headers={"Retry-After": "5"}) from exc
+
     result.update(execution.status())
-    if not execution.isolated:
-        result["warning"] = ("NOT a security boundary — dev-only provider. "
-                             "Do not execute untrusted code.")
-    db.audit(user["username"], "execute.python", f"provider={execution.name} ok={result['ok']}")
+    result["capacity"] = governor.stats()
+    db.audit(user["username"], "execute.python",
+             f"provider={execution.name} ok={result['ok']} "
+             f"killed={result.get('processes_killed', 0)}")
     return result
 
 
@@ -445,6 +594,21 @@ class TelegramRequest(BaseModel):
     text: str
     chat_id: str = "mock-chat"
     idempotency_key: str | None = None
+
+
+def _require_trusted_action(user: dict, action: str, content: str) -> TrustedText:
+    """Every consequential action needs a TRUSTED initiating context (M3).
+
+    Content that originated in a document, email, web page, tool output or model
+    response can never satisfy this, no matter how it is phrased.
+    """
+    ctx = TrustedText(content, Provenance.AUTHENTICATED_USER, source=user["username"])
+    try:
+        require_authority([ctx], action)
+    except TrustViolation as exc:
+        db.audit(user["username"], f"action.denied.trust.{action}", str(exc)[:120])
+        raise HTTPException(403, str(exc)) from exc
+    return ctx
 
 
 def _ledger_guard(key: str | None, fingerprint: str, connector: str, operation: str) -> dict | None:
@@ -494,6 +658,7 @@ async def wf_meeting(body: MeetingRequest, authorization: str | None = Header(No
     check_autonomy(body.autonomy_level, settings.max_autonomy_level)
     fp = hashlib.sha256(f"{body.attendee}|{body.autonomy_level}".encode()).hexdigest()
     _require_connector_write(user, "google-calendar", scopes)
+    _require_trusted_action(user, "connector:write", f"{body.attendee}|{body.autonomy_level}")
     replay = _ledger_guard(body.idempotency_key, fp, "google-calendar", "event.create")
     if replay:
         return replay
@@ -519,6 +684,7 @@ async def wf_telegram(body: TelegramRequest, authorization: str | None = Header(
     _require(authorization, "workflows:run", scopes)
     fp = hashlib.sha256(f"{body.chat_id}|{body.text}".encode()).hexdigest()
     _require_connector_write(user, "telegram", scopes)
+    _require_trusted_action(user, "connector:write", f"{body.chat_id}|{body.text}")
     replay = _ledger_guard(body.idempotency_key, fp, "telegram", "message.send")
     if replay:
         return replay
@@ -543,6 +709,7 @@ async def wf_gmail_draft(body: GmailDraftRequest, authorization: str | None = He
     _require(authorization, "workflows:run", scopes)
     fp = hashlib.sha256(f"{body.message_id}|{body.body}".encode()).hexdigest()
     _require_connector_write(user, "gmail", scopes)
+    _require_trusted_action(user, "connector:write", f"{body.message_id}|{body.body}")
     replay = _ledger_guard(body.idempotency_key, fp, "gmail", "draft.create")
     if replay:
         return replay

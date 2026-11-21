@@ -56,6 +56,12 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+# A fixed, valid hash used to make "unknown user" cost the same as "wrong
+# password" (audit finding A-12: 3 ms vs 77 ms was a 25x enumeration signal).
+_DUMMY_HASH = ("pbkdf2_sha256$200000$00000000000000000000000000000000$"
+               "0000000000000000000000000000000000000000000000000000000000000000")
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -69,10 +75,29 @@ def totp(secret_b32: str, at: float | None = None, digits: int = 6) -> str:
     return str(code % (10 ** digits)).zfill(digits)
 
 
+def totp_step(at: float | None = None) -> int:
+    return int((at or time.time()) // 30)
+
+
 def verify_totp(secret_b32: str, code: str, window: int = 1) -> bool:
+    """Stateless verification. Retained for tests/diagnostics only.
+
+    Authentication MUST use AuthService.verify_totp_once(), which additionally
+    rejects replays of a code that was already accepted (audit finding A-10).
+    """
     now = time.time()
     return any(hmac.compare_digest(totp(secret_b32, now + d * 30), code)
                for d in range(-window, window + 1))
+
+
+def verify_totp_step(secret_b32: str, code: str, window: int = 1) -> int | None:
+    """Return the time-step that matched, or None. Caller enforces monotonicity."""
+    now = time.time()
+    for d in range(-window, window + 1):
+        candidate_at = now + d * 30
+        if hmac.compare_digest(totp(secret_b32, candidate_at), code):
+            return totp_step(candidate_at)
+    return None
 
 
 def new_mfa_secret() -> str:
@@ -99,14 +124,63 @@ class AuthService:
         r = self.db.query_one("SELECT * FROM users WHERE username=?", (username,))
         return dict(r) if r else None
 
-    def authenticate(self, username: str, password: str, mfa_code: str | None = None) -> dict | None:
+    def authenticate(self, username: str, password: str, mfa_code: str | None = None,
+                     *, throttle=None, remote: str = "") -> dict | None:
+        """Verify credentials, with throttling and MFA replay protection.
+
+        Returns the user row on success, None on any failure. Failures look
+        identical to the caller (no user enumeration), and unknown users still
+        pay a hash-verification cost so timing does not distinguish them (A-12).
+        """
+        if throttle is not None:
+            throttle.check(username, remote)
+
         user = self.get_user(username)
-        if not user or not verify_password(password, user["password_hash"]):
+        if user is None:
+            # Constant-work path: verify against a dummy hash so a missing user
+            # costs the same as a wrong password.
+            verify_password(password, _DUMMY_HASH)
+            if throttle is not None:
+                throttle.record_failure(username, remote)
             return None
+
+        if not verify_password(password, user["password_hash"]):
+            if throttle is not None:
+                throttle.record_failure(username, remote)
+            return None
+
         if user["mfa_enabled"]:
-            if not mfa_code or not verify_totp(user["mfa_secret"], mfa_code):
+            if not mfa_code:
+                if throttle is not None:
+                    throttle.record_failure(username, remote)
                 return None
+            step = verify_totp_step(user["mfa_secret"], mfa_code)
+            if step is None:
+                if throttle is not None:
+                    throttle.record_failure(username, remote)
+                return None
+            # Replay protection: a code may be used once, and only forward in time.
+            if not self._claim_totp_step(user["id"], step):
+                self.db.audit(user["username"], "auth.mfa.replay_rejected",
+                              f"step={step}")
+                if throttle is not None:
+                    throttle.record_failure(username, remote)
+                return None
+
+        if throttle is not None:
+            throttle.record_success(username, remote)
         return user
+
+    def _claim_totp_step(self, user_id: str, step: int) -> bool:
+        """Atomically accept a TOTP step only if it is newer than the last used.
+
+        Implemented as a conditional UPDATE: the database decides, so two
+        concurrent logins cannot both consume the same code.
+        """
+        cur = self.db.execute(
+            "UPDATE users SET mfa_last_step=? WHERE id=? AND mfa_last_step < ?",
+            (step, user_id, step))
+        return cur.rowcount == 1
 
     def enable_mfa(self, user_id: str) -> str:
         secret = new_mfa_secret()

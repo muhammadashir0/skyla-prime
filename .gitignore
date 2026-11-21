@@ -7,3 +7,11 @@ node_modules/
 dist/
 build/
 *.egg-info/
+
+# v0.3.0: the containment supervisor is built from skyla-sup.c at runtime.
+# The binary is host-specific and must never be committed (built by
+# skyla.execution.workload.ensure_supervisor()).
+skyla/execution/skyla-sup
+
+# Bootstrap credentials are single-use and must never be committed.
+**/bootstrap_admin_credential.txt

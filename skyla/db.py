@@ -4,6 +4,7 @@ single seam where the backend can be swapped without touching callers."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -62,6 +63,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts
     USING fts5(title, content, content='documents', content_rowid='rowid');
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
@@ -84,6 +86,7 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL DEFAULT 'operator',
     mfa_secret TEXT,
     mfa_enabled INTEGER NOT NULL DEFAULT 0,
+    mfa_last_step INTEGER NOT NULL DEFAULT 0,
     grants TEXT DEFAULT '[]',
     created_at REAL NOT NULL
 );
@@ -141,15 +144,27 @@ MIGRATIONS: list[tuple[int, str]] = [
     (2, "v0.2.0 identity + ledger + usage tables"),
     (3, "owner_id columns for cross-user isolation"),
     (4, "per-agent/per-connector grants column on users"),
+    (5, "memories.owner_id NOT NULL for tenant isolation (A-05)"),
+    (6, "users.mfa_last_step for TOTP replay protection (A-10)"),
 ]
 
 _OWNER_COLUMNS = {"tasks": "owner_id", "documents": "owner_id", "memories": "owner_id"}
+
+
+def _secure_db_dir(directory: Path) -> None:
+    """The database directory must be 0700: it contains credentials-adjacent data."""
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
 
 
 class Database:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        _secure_db_dir(Path(path).parent)
+        existed = Path(path).exists()
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -158,12 +173,29 @@ class Database:
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         self._apply_migrations()
+        # Holds password hashes and TOTP secrets: never group/world readable.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(f"{path}{suffix}", 0o600)
+            except OSError:
+                pass
 
     def _apply_migrations(self) -> None:
         """Apply pending schema migrations in order (idempotent)."""
         for version, _desc in MIGRATIONS:
             if self.query_one("SELECT version FROM schema_version WHERE version=?", (version,)):
                 continue
+            if version == 6:
+                cols = [r[1] for r in self.query("PRAGMA table_info(users)")]
+                if "mfa_last_step" not in cols:
+                    self.execute("ALTER TABLE users ADD COLUMN mfa_last_step INTEGER NOT NULL DEFAULT 0")
+            if version == 5:
+                cols = [r[1] for r in self.query("PRAGMA table_info(memories)")]
+                if "owner_id" not in cols:
+                    self.execute("ALTER TABLE memories ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+                    # Legacy rows predate tenant isolation; they are owned by the
+                    # bootstrap admin, exactly like v0.1.0 task/document rows.
+                    self.execute("UPDATE memories SET owner_id='admin' WHERE owner_id=''")
             if version == 4:
                 cols = [r[1] for r in self.query("PRAGMA table_info(users)")]
                 if "grants" not in cols:
@@ -315,23 +347,69 @@ class Database:
             " ORDER BY created_at DESC LIMIT ?", (limit,))]
 
     # -- memory ----------------------------------------------------------
-    def set_memory(self, kind: str, key: str, value: str, source: str, reliability: float) -> str:
+    # -- memory (tenant-isolated, A-05) ---------------------------------
+    # Every operation takes an explicit tenant. There is no "fetch then filter"
+    # path: ownership is part of the WHERE clause so a forgotten check cannot
+    # leak rows. An empty tenant is rejected -- deny by default.
+    @staticmethod
+    def _require_tenant(owner_id: str | None) -> str:
+        if not owner_id or not str(owner_id).strip():
+            raise ValueError("tenant identity required for memory operations")
+        return str(owner_id)
+
+    def set_memory(self, kind: str, key: str, value: str, source: str,
+                   reliability: float, owner_id: str) -> str:
+        tenant = self._require_tenant(owner_id)
         mid = f"mem_{uuid.uuid4().hex[:10]}"
         now = time.time()
         self.execute(
-            "INSERT INTO memories (id,kind,key,value,source,reliability,created_at,updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (mid, kind, key, value, source, reliability, now, now))
+            "INSERT INTO memories (id,owner_id,kind,key,value,source,reliability,"
+            "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (mid, tenant, kind, key, value, source, reliability, now, now))
         return mid
 
-    def search_memories(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.query(
-            "SELECT * FROM memories WHERE value LIKE ? OR key LIKE ? ORDER BY reliability DESC LIMIT ?",
-            (f"%{query}%", f"%{query}%", limit))]
+    def get_memory(self, mid: str, owner_id: str) -> dict[str, Any] | None:
+        """Fetch one memory, or None if it is not owned by this tenant.
 
-    def delete_memory(self, mid: str) -> bool:
-        cur = self.execute("DELETE FROM memories WHERE id=?", (mid,))
+        Returning None (not a 403) keeps existence private.
+        """
+        tenant = self._require_tenant(owner_id)
+        r = self.query_one("SELECT * FROM memories WHERE id=? AND owner_id=?",
+                           (mid, tenant))
+        return dict(r) if r else None
+
+    def search_memories(self, query: str, owner_id: str,
+                        limit: int = 10) -> list[dict[str, Any]]:
+        tenant = self._require_tenant(owner_id)
+        return [dict(r) for r in self.query(
+            "SELECT * FROM memories WHERE owner_id=? AND (value LIKE ? OR key LIKE ?)"
+            " ORDER BY reliability DESC LIMIT ?",
+            (tenant, f"%{query}%", f"%{query}%", limit))]
+
+    def list_memories(self, owner_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        tenant = self._require_tenant(owner_id)
+        return [dict(r) for r in self.query(
+            "SELECT * FROM memories WHERE owner_id=? ORDER BY created_at DESC LIMIT ?",
+            (tenant, limit))]
+
+    def update_memory(self, mid: str, owner_id: str, value: str) -> bool:
+        tenant = self._require_tenant(owner_id)
+        cur = self.execute(
+            "UPDATE memories SET value=?, updated_at=? WHERE id=? AND owner_id=?",
+            (value, time.time(), mid, tenant))
         return cur.rowcount > 0
+
+    def delete_memory(self, mid: str, owner_id: str) -> bool:
+        tenant = self._require_tenant(owner_id)
+        cur = self.execute("DELETE FROM memories WHERE id=? AND owner_id=?",
+                           (mid, tenant))
+        return cur.rowcount > 0
+
+    def export_memories(self, owner_id: str) -> list[dict[str, Any]]:
+        """Full tenant export -- scoped in SQL, identical to list but unbounded."""
+        tenant = self._require_tenant(owner_id)
+        return [dict(r) for r in self.query(
+            "SELECT * FROM memories WHERE owner_id=? ORDER BY created_at", (tenant,))]
 
     # -- idempotency ledger (WS3) --------------------------------------
     def ledger_begin(self, key: str, fingerprint: str, connector: str, operation: str) -> dict:

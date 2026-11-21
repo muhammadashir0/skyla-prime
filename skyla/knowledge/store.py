@@ -30,11 +30,29 @@ class KnowledgeStore:
     def list(self, limit: int = 50) -> list[dict]:
         return self.db.list_documents(limit)
 
-    # -- memory ----------------------------------------------------------
-    def remember(self, key: str, value: str, kind: str = "preference",
+    # -- memory (tenant-isolated, A-05) ------------------------------------
+    # `owner_id` is a REQUIRED argument on every method. Omitting it is a
+    # programming error that raises, never a silent read of every tenant.
+    def remember(self, key: str, value: str, owner_id: str, kind: str = "preference",
                  source: str = "user", reliability: float = 0.8) -> dict:
-        mid = self.db.set_memory(kind, key, value, source, reliability)
-        return {"id": mid, "kind": kind, "key": key, "reliability": reliability}
+        mid = self.db.set_memory(kind, key, value, source, reliability, owner_id=owner_id)
+        return {"id": mid, "kind": kind, "key": key, "reliability": reliability,
+                "owner_id": owner_id}
 
-    def recall(self, query: str, limit: int = 10) -> list[dict]:
-        return self.db.search_memories(query, limit)
+    def recall(self, query: str, owner_id: str, limit: int = 10) -> list[dict]:
+        return self.db.search_memories(query, owner_id=owner_id, limit=limit)
+
+    def list_memories(self, owner_id: str, limit: int = 200) -> list[dict]:
+        return self.db.list_memories(owner_id, limit)
+
+    def get_memory(self, mid: str, owner_id: str) -> dict | None:
+        return self.db.get_memory(mid, owner_id)
+
+    def update_memory(self, mid: str, value: str, owner_id: str) -> bool:
+        return self.db.update_memory(mid, owner_id, value)
+
+    def forget(self, mid: str, owner_id: str) -> bool:
+        return self.db.delete_memory(mid, owner_id)
+
+    def export_memories(self, owner_id: str) -> list[dict]:
+        return self.db.export_memories(owner_id)

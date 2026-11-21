@@ -61,9 +61,12 @@ except OSError as e:
     print('BLOCKED', e.errno)
 """
         r = provider.run(code)
-        assert r["ok"], r["stderr"]
-        assert "CONNECTED" not in r["stdout"]
-        assert "BLOCKED" in r["stdout"]
+        # v0.3.0: socket() itself is denied by the seccomp allowlist, so the
+        # isolation is stronger than "connection refused". Either way, no bytes
+        # may reach the host listener.
+        assert "CONNECTED" not in r["stdout"], r["stdout"]
+        assert ("PermissionError" in r["stderr"] or "BLOCKED" in r["stdout"]
+                or "not permitted" in r["stderr"]), (r["stdout"], r["stderr"])
         # no connection ever reached the host listener
         try:
             srv.accept()

@@ -95,91 +95,100 @@ class ContainerProvider(ExecutionProvider):
 
 
 class NamespaceProvider(ExecutionProvider):
-    """unshare(user,mount,pid,net) + chroot into a minimal rootfs.
+    """Contained execution: user/mount/PID/net namespaces + skyla-sup supervisor.
 
-    Isolation properties (verified by adversarial tests):
-      - host filesystem invisible (chroot; only ro python runtime + workspace)
-      - network namespace with no routes (disabled by default)
-      - fake root inside user namespace (cannot escape to host uid)
-      - read-only runtime binds; workspace is the only writable area
-      - rlimits (memory/CPU) + hard timeout + output caps
+    All controls live in the compiled supervisor (see EXECUTION_HOST_SECURITY.md):
+    capabilities dropped and verified zero, PR_SET_NO_NEW_PRIVS, seccomp
+    allowlist, Landlock write-confinement, rlimits, PID-namespace termination.
+
+    If the supervisor cannot be built or a mandatory control fails, execution is
+    REFUSED. There is no silent degradation to an unsafe provider.
     """
     name = "namespace"
     isolated = True
     safe_for_untrusted = True
 
     def __init__(self):
-        self.unshare = shutil.which("unshare")
-        self.chroot_bin = "/usr/sbin/chroot" if Path("/usr/sbin/chroot").exists() else shutil.which("chroot")
+        from . import workload
+        self._wl = workload
 
     def status(self) -> dict:
+        from .workload import containment_status, SupervisorUnavailable
         s = super().status()
-        s["available"] = bool(self.unshare and self.chroot_bin)
+        try:
+            c = containment_status()
+            s["available"] = bool(c.get("supervisor"))
+            s["controls"] = {
+                "capability_drop": "verified-zero",
+                "no_new_privs": True,
+                "seccomp": bool(c.get("seccomp")),
+                "landlock_abi": c.get("landlock_abi", 0),
+                "cgroup_v2": bool(c.get("cgroup_v2")),
+                "user_namespace": c.get("userns"),
+                "network_namespace": c.get("netns"),
+                "termination": "pid-namespace-kill",
+            }
+        except Exception as exc:  # SupervisorUnavailable or build failure
+            s["available"] = False
+            s["isolated"] = False
+            s["safe_for_untrusted"] = False
+            s["error"] = str(exc)
         return s
 
     def run(self, code, timeout_s=30, memory_mb=512, network=False) -> dict:
-        if not (self.unshare and self.chroot_bin):
+        from .workload import SupervisorUnavailable, run_isolated
+        if network:
+            # Approved-network execution is not implemented: refuse rather than
+            # silently granting host networking to untrusted code.
             return {"ok": False, "stdout": "", "returncode": -1,
-                    "stderr": "unshare/chroot unavailable; namespace provider disabled"}
-        with tempfile.TemporaryDirectory(prefix="skyla_ns_") as base:
-            rootfs = Path(base) / "rootfs"
-            ws = Path(base) / "ws"
-            for d in ("usr/bin", "usr/lib", "lib", "lib64", "bin", "sbin",
-                      "etc", "workspace", "tmp", "proc", "dev"):
-                (rootfs / d).mkdir(parents=True, exist_ok=True)
-            ws.mkdir()
-            (ws / "script.py").write_text(textwrap.dedent(code))
-            inner = Path(base) / "inner.sh"
-            net_flag = "" if network else "-n"
-            inner.write_text(textwrap.dedent(f"""\
-                set -e
-                mount --make-rprivate /
-                mount --bind -o ro /usr/bin {rootfs}/usr/bin
-                mount --bind -o ro /usr/lib {rootfs}/usr/lib
-                mount --bind -o ro /lib {rootfs}/lib 2>/dev/null || true
-                mount --bind -o ro /lib64 {rootfs}/lib64 2>/dev/null || true
-                mount --bind -o ro /bin {rootfs}/bin 2>/dev/null || true
-                mount --bind -o ro /sbin {rootfs}/sbin 2>/dev/null || true
-                mount --bind {ws} {rootfs}/workspace
-                mount -t tmpfs -o ro tmpfs {rootfs}/etc
-                mount -t tmpfs tmpfs {rootfs}/tmp
-                mount -t proc proc {rootfs}/proc 2>/dev/null || true
-                mount -t tmpfs tmpfs {rootfs}/dev
-                ulimit -v {memory_mb * 1024}
-                exec {self.chroot_bin} {rootfs} /usr/bin/python3 /workspace/script.py
-            """))
-            cmd = [self.unshare, "-Urmpf"] + ([net_flag] if net_flag else []) + ["sh", str(inner)]
-            env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
-            try:
-                proc = subprocess.run(cmd, capture_output=True, text=True,
-                                      timeout=timeout_s + 5, env=env, cwd=base)
-                return {"ok": proc.returncode == 0, "stdout": proc.stdout[-8000:],
-                        "stderr": proc.stderr[-8000:], "returncode": proc.returncode}
-            except subprocess.TimeoutExpired as exc:
-                out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else ""
-                return {"ok": False, "stdout": out[-4000:],
-                        "stderr": f"Timed out after {timeout_s}s", "returncode": -1}
+                    "stderr": "Network-enabled execution is not supported by the "
+                              "contained provider (deny by default)."}
+        try:
+            r = run_isolated(
+                code,
+                cpu_s=max(1, int(timeout_s)),
+                memory_mb=int(memory_mb),
+                fsize_mb=32,
+                nproc=24,
+                timeout_s=int(timeout_s),
+                sandbox_uid=65534,
+                sandbox_gid=65534,
+            )
+        except SupervisorUnavailable as exc:
+            # FAIL CLOSED. No fallback provider, ever.
+            return {"ok": False, "stdout": "", "returncode": -1,
+                    "stderr": f"Execution refused: containment unavailable ({exc})",
+                    "refused": True}
+        return {"ok": r.ok, "stdout": r.stdout, "stderr": r.stderr,
+                "returncode": r.returncode, "timed_out": r.timed_out,
+                "terminated": r.terminated, "processes_killed": r.processes_killed,
+                "controls": r.controls}
 
 
 def get_execution_provider() -> ExecutionProvider:
-    """Select provider by SKYLA_EXECUTION_PROVIDER (default: auto).
+    """Select an execution provider.
 
-    auto → namespace if available, else container if available, else
-    restricted (dev-only, labeled unsafe). Never silently claims isolation.
+    Fail-closed policy (v0.3.0): `auto` NEVER falls back to the unsafe
+    RestrictedProvider. If no contained runtime is available, the DisabledProvider
+    is returned and arbitrary execution is refused outright.
     """
     mode = os.getenv("SKYLA_EXECUTION_PROVIDER", "auto").lower()
     if mode == "disabled":
         return DisabledProvider()
     if mode == "restricted":
-        return RestrictedProvider()
+        # Explicit opt-in only, for a developer who has read the warning.
+        if os.getenv("SKYLA_ALLOW_UNSAFE_EXECUTION") == "1":
+            return RestrictedProvider()
+        return DisabledProvider()
     if mode == "container":
-        return ContainerProvider()
+        cont = ContainerProvider()
+        return cont if cont.status()["available"] else DisabledProvider()
     if mode == "namespace":
         return NamespaceProvider()
     ns = NamespaceProvider()
-    if ns.status()["available"]:
+    if ns.status().get("available"):
         return ns
     cont = ContainerProvider()
     if cont.status()["available"]:
         return cont
-    return RestrictedProvider()
+    return DisabledProvider()   # NOT RestrictedProvider
