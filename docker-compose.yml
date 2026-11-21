@@ -1,0 +1,23 @@
+services:
+  skyla:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      SKYLA_API_TOKEN: "${SKYLA_API_TOKEN:-}"
+      SKYLA_MAX_AUTONOMY: "${SKYLA_MAX_AUTONOMY:-2}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      QWEN_API_KEY: "${QWEN_API_KEY:-}"
+      GLM_API_KEY: "${GLM_API_KEY:-}"
+      SKYLA_CUSTOM_BASE_URL: "${SKYLA_CUSTOM_BASE_URL:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID:-}"
+      GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET:-}"
+      GOOGLE_REFRESH_TOKEN: "${GOOGLE_REFRESH_TOKEN:-}"
+    volumes:
+      - skyla-data:/app/data
+volumes:
+  skyla-data:

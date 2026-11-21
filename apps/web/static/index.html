@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SKYLA PRIME — Command</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="mark">✦</span> SKYLA <b>PRIME</b> <span class="sub">COMMAND</span></div>
+  <div class="header-right">
+    <span id="health" class="pill">connecting…</span>
+    <input id="token" type="password" placeholder="API token (if set)" autocomplete="off">
+  </div>
+</header>
+<nav id="tabs">
+  <button data-tab="dashboard" class="active">Dashboard</button>
+  <button data-tab="tasks">Tasks</button>
+  <button data-tab="agents">Agents</button>
+  <button data-tab="models">Models</button>
+  <button data-tab="connect">Prime Connect</button>
+  <button data-tab="knowledge">Knowledge</button>
+  <button data-tab="ops">Operations</button>
+  <button data-tab="security">Security</button>
+</nav>
+<main>
+  <section id="tab-dashboard" class="tab active">
+    <div class="cards">
+      <div class="card"><h3>Tasks</h3><div class="big" id="stat-tasks">—</div><span id="stat-tasks-sub"></span></div>
+      <div class="card"><h3>Providers</h3><div class="big" id="stat-providers">—</div><span>configured model providers</span></div>
+      <div class="card"><h3>Connectors</h3><div class="big" id="stat-connectors">—</div><span id="stat-connectors-sub"></span></div>
+      <div class="card"><h3>Documents</h3><div class="big" id="stat-docs">—</div><span>knowledge records</span></div>
+    </div>
+    <div class="panel">
+      <h2>New task</h2>
+      <textarea id="task-input" rows="3" placeholder="Describe the task… e.g. Research solid-state batteries and produce a cited report"></textarea>
+      <div class="row">
+        <label>Autonomy level
+          <select id="task-level"><option value="0">0 · Observe</option><option value="1">1 · Prepare</option><option value="2">2 · Routine execution</option></select>
+        </label>
+        <button id="task-submit" class="primary">Submit task</button>
+      </div>
+      <div id="task-result" class="output"></div>
+    </div>
+    <div class="panel"><h2>Recent tasks</h2><div id="recent-tasks"></div></div>
+  </section>
+
+  <section id="tab-tasks" class="tab">
+    <div class="panel"><h2>All tasks</h2><button id="refresh-tasks">Refresh</button><div id="task-list"></div></div>
+  </section>
+
+  <section id="tab-agents" class="tab">
+    <div class="panel"><h2>Agent registry</h2><div id="agent-list"></div></div>
+  </section>
+
+  <section id="tab-models" class="tab">
+    <div class="panel">
+      <h2>Model router</h2>
+      <div class="row"><label>Task kind
+        <select id="route-kind"><option>general</option><option>coding</option><option>research</option><option>reasoning</option><option>routine</option><option>private</option></select></label>
+        <button id="route-preview">Preview routing</button></div>
+      <div id="route-output" class="output"></div>
+    </div>
+    <div class="panel"><h2>Model registry</h2><div id="model-list"></div></div>
+  </section>
+
+  <section id="tab-connect" class="tab">
+    <div class="panel"><h2>Connected applications</h2><div id="connector-list"></div></div>
+  </section>
+
+  <section id="tab-knowledge" class="tab">
+    <div class="panel">
+      <h2>Ingest document</h2>
+      <input id="doc-title" placeholder="Title">
+      <textarea id="doc-content" rows="4" placeholder="Document content…"></textarea>
+      <button id="doc-submit" class="primary">Ingest</button>
+      <div id="doc-result" class="output"></div>
+    </div>
+    <div class="panel">
+      <h2>Search knowledge</h2>
+      <div class="row"><input id="search-q" placeholder="Query…"><button id="search-btn">Search</button></div>
+      <div id="search-output"></div>
+    </div>
+    <div class="panel"><h2>Documents</h2><div id="doc-list"></div></div>
+  </section>
+
+  <section id="tab-ops" class="tab">
+    <div class="panel"><h2>Workflow B · Inbox triage</h2><button id="wf-inbox">Run inbox triage</button><div id="wf-inbox-out" class="output"></div></div>
+    <div class="panel"><h2>Workflow C · Meeting</h2>
+      <div class="row"><input id="meet-attendee" placeholder="Attendee email"><button id="wf-meeting">Propose meeting</button></div>
+      <div id="wf-meeting-out" class="output"></div></div>
+    <div class="panel"><h2>Workflow D · Web research</h2>
+      <div class="row"><input id="research-url" placeholder="https://…"><button id="wf-research">Fetch &amp; summarize</button></div>
+      <div id="wf-research-out" class="output"></div></div>
+    <div class="panel"><h2>Workflow E · Telegram</h2>
+      <div class="row"><input id="tg-text" placeholder="Command, e.g. status"><button id="wf-telegram">Send</button></div>
+      <div id="wf-telegram-out" class="output"></div></div>
+    <div class="panel"><h2>Sandboxed Python</h2>
+      <textarea id="code-input" rows="4">print("SKYLA sandbox OK:", 6*7)</textarea>
+      <button id="code-run">Execute</button><div id="code-out" class="output"></div></div>
+  </section>
+
+  <section id="tab-security" class="tab">
+    <div class="panel"><h2>Audit log</h2><button id="refresh-audit">Refresh</button><div id="audit-list"></div></div>
+  </section>
+</main>
+<footer>SKYLA PRIME · Think Beyond. Execute with Intelligence. · <span id="foot-status"></span></footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

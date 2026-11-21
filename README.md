@@ -112,9 +112,23 @@ External actions, sensitive information, credentials and consequential operation
 
 ### 🚀 PROJECT STATUS
 
-**Early-stage research and engineering initiative.**
+**v0.1.0 — Phase 0–1 milestone implemented (Nov 2026).**
 
-Architecture, research, infrastructure and implementation are intended to evolve through independently tested milestones.
+Working platform: FastAPI backend, SKYLA PRIME COMMAND dashboard, multi-provider
+model gateway with dynamic routing, durable task orchestration with independent
+verification, 5 specialist agents, PRIME KNOWLEDGE (FTS + memory + web research),
+PRIME CONNECT (Gmail / Google Calendar / Telegram, live-ready in mock-safe mode),
+Workflows B–E, sandboxed execution, audit logging, 31 passing tests.
+
+Frontier model calls and live connector operations require provider credentials
+(see `.env.example`). Mock mode is explicit everywhere — never labeled live.
+
+**Quick start:**
+```bash
+pip install -e ".[dev]"
+python3 -m uvicorn skyla.api.app:app --host 0.0.0.0 --port 8000
+# Dashboard: http://localhost:8000 · Tests: python3 -m pytest tests/ -q
+```
 
 Planned capabilities are not represented as completed functionality. Performance claims will be supported by reproducible evaluation results.
 
