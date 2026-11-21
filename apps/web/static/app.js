@@ -1,11 +1,72 @@
 const $ = id => document.getElementById(id);
-const token = () => $('token').value.trim();
-const headers = () => token() ? {Authorization: 'Bearer ' + token(), 'Content-Type': 'application/json'} : {'Content-Type': 'application/json'};
+
+// ---- session (v0.2.0): token lives in memory only, never localStorage ----
+let session = {token: null, user: null};
+
+const headers = () => session.token
+  ? {Authorization: 'Bearer ' + session.token, 'Content-Type': 'application/json'}
+  : {'Content-Type': 'application/json'};
+
 async function api(path, opts = {}) {
   const r = await fetch(path, {...opts, headers: headers()});
+  if (r.status === 401) { signOut(true); throw new Error('401 Unauthorized — please sign in'); }
   if (!r.ok) throw new Error(r.status + ' ' + (await r.text()).slice(0, 300));
   return r.json();
 }
+
+function signOut(silent) {
+  const old = session.token;
+  session = {token: null, user: null};
+  $('login-overlay').hidden = false;
+  $('logout-btn').hidden = true;
+  $('whoami').hidden = true;
+  $('login-pass').value = ''; $('login-mfa').value = '';
+  if (!silent && old) {
+    fetch('/api/auth/logout', {method: 'POST', headers: {Authorization: 'Bearer ' + old}}).catch(() => {});
+  }
+}
+
+function signedIn(data) {
+  session = {token: data.token, user: data.user || {}};
+  $('login-overlay').hidden = true;
+  $('logout-btn').hidden = false;
+  $('whoami').hidden = false;
+  const u = data.user || {};
+  $('whoami').textContent = `${u.username || ''} · ${u.role || ''}`;
+  $('login-error').textContent = '';
+  refreshStats();
+}
+
+$('login-form').onsubmit = async (e) => {
+  e.preventDefault();
+  $('login-error').textContent = '';
+  $('login-submit').disabled = true;
+  try {
+    const body = {username: $('login-user').value.trim(), password: $('login-pass').value};
+    const mfa = $('login-mfa').value.trim();
+    if (mfa) body.mfa_code = mfa;
+    const r = await fetch('/api/auth/login', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (String(data.detail || '').toLowerCase().includes('mfa')) {
+        $('mfa-row').hidden = false;
+        $('login-error').textContent = 'Enter your 6-digit MFA code.';
+        $('login-mfa').focus();
+      } else {
+        $('login-error').textContent = data.detail || ('Sign-in failed (' + r.status + ')');
+      }
+      return;
+    }
+    signedIn(data);
+  } catch (err) {
+    $('login-error').textContent = 'Network error: ' + err.message;
+  } finally {
+    $('login-submit').disabled = false;
+  }
+};
+
+$('logout-btn').onclick = () => signOut(false);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const show = (id, obj) => { $(id).textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); };
 
@@ -101,5 +162,6 @@ $('wf-telegram').onclick = async () => { show('wf-telegram-out', 'Sending…'); 
 $('code-run').onclick = async () => { show('code-out', 'Running…'); try { show('code-out', await api('/api/execute/python', {method: 'POST', body: JSON.stringify({code: $('code-input').value})})); } catch (e) { show('code-out', 'Error: ' + e.message); } };
 $('refresh-audit').onclick = refreshAudit;
 
-refreshStats(); refreshAgents(); refreshModels(); refreshAudit();
-setInterval(refreshStats, 15000);
+// Nothing is fetched until the operator signs in (every protected route needs auth).
+$('login-user').focus();
+setInterval(() => { if (session.token) refreshStats(); }, 15000);

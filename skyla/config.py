@@ -14,7 +14,7 @@ class Settings(BaseModel):
     app_name: str = "SKYLA PRIME"
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
-    db_path: str = Field(default=str(ROOT / "data" / "skyla.db"))
+    db_path: str = Field(default=os.getenv("SKYLA_DB_PATH") or str(ROOT / "data" / "skyla.db"))
     # API token: if set, all /api/* calls require it (Bearer). Empty = local dev open.
     api_token: str = Field(default=os.getenv("SKYLA_API_TOKEN", ""))
     # Default autonomy ceiling for the deployment (0..4). See docs/SECURITY_ARCHITECTURE.md.

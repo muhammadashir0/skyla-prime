@@ -76,7 +76,74 @@ CREATE TABLE IF NOT EXISTS connector_state (
     detail TEXT,
     updated_at REAL NOT NULL
 );
+-- v0.2.0: identity, idempotency ledger, observability
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'operator',
+    mfa_secret TEXT,
+    mfa_enabled INTEGER NOT NULL DEFAULT 0,
+    grants TEXT DEFAULT '[]',
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at REAL NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    scopes TEXT NOT NULL DEFAULT '[]',
+    expires_at REAL NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS action_ledger (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    fingerprint TEXT NOT NULL,
+    connector TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    provider_response TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS provider_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ok'
+);
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
 """
+
+# Ordered, versioned migrations (WS5). Each is idempotent (IF NOT EXISTS /
+# guarded ALTER). Reversible where feasible; down-migrations documented in
+# docs/DATABASE_MIGRATION_PLAN.md.
+MIGRATIONS: list[tuple[int, str]] = [
+    (1, "baseline v0.1.0 schema"),
+    (2, "v0.2.0 identity + ledger + usage tables"),
+    (3, "owner_id columns for cross-user isolation"),
+    (4, "per-agent/per-connector grants column on users"),
+]
+
+_OWNER_COLUMNS = {"tasks": "owner_id", "documents": "owner_id", "memories": "owner_id"}
 
 
 class Database:
@@ -90,6 +157,28 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """Apply pending schema migrations in order (idempotent)."""
+        for version, _desc in MIGRATIONS:
+            if self.query_one("SELECT version FROM schema_version WHERE version=?", (version,)):
+                continue
+            if version == 4:
+                cols = [r[1] for r in self.query("PRAGMA table_info(users)")]
+                if "grants" not in cols:
+                    self.execute("ALTER TABLE users ADD COLUMN grants TEXT DEFAULT '[]'")
+            if version == 3:
+                for table, col in _OWNER_COLUMNS.items():
+                    cols = [r[1] for r in self.query(f"PRAGMA table_info({table})")]
+                    if col not in cols:
+                        self.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT DEFAULT 'admin'")
+            self.execute("INSERT INTO schema_version (version, applied_at) VALUES (?,?)",
+                         (version, time.time()))
+
+    def schema_version(self) -> int:
+        r = self.query_one("SELECT MAX(version) AS v FROM schema_version")
+        return int(r["v"]) if r and r["v"] else 0
 
     # -- generic helpers -------------------------------------------------
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -183,6 +272,15 @@ class Database:
             "UPDATE tasks SET status='interrupted' WHERE status='running'")
         return cur.rowcount
 
+    def recover_interrupted_ledger(self) -> int:
+        """WS3: ledger entries claimed but never completed (process died mid-write)
+        are marked 'unknown'. Their external effect is indeterminate, so a retry
+        must reconcile provider state before re-executing (see IDEMPOTENCY_DESIGN.md)."""
+        cur = self.execute(
+            "UPDATE action_ledger SET state='unknown', updated_at=?"
+            " WHERE state='pending'", (time.time(),))
+        return cur.rowcount
+
     # -- documents -------------------------------------------------------
     def add_document(self, title: str, source: str, kind: str, content: str, license_: str) -> str:
         import hashlib
@@ -234,6 +332,47 @@ class Database:
     def delete_memory(self, mid: str) -> bool:
         cur = self.execute("DELETE FROM memories WHERE id=?", (mid,))
         return cur.rowcount > 0
+
+    # -- idempotency ledger (WS3) --------------------------------------
+    def ledger_begin(self, key: str, fingerprint: str, connector: str, operation: str) -> dict:
+        """Claim an idempotency key. Returns {status: new|duplicate|conflict, record}."""
+        existing = self.query_one("SELECT * FROM action_ledger WHERE idempotency_key=?", (key,))
+        if existing:
+            if existing["fingerprint"] != fingerprint:
+                return {"status": "conflict", "record": dict(existing)}
+            return {"status": "duplicate", "record": dict(existing)}
+        lid = f"op_{uuid.uuid4().hex[:10]}"
+        now = time.time()
+        self.execute(
+            "INSERT INTO action_ledger (id,idempotency_key,fingerprint,connector,operation,state,attempts,created_at,updated_at)"
+            " VALUES (?,?,?,?,?,?,0,?,?)",
+            (lid, key, fingerprint, connector, operation, "pending", now, now))
+        return {"status": "new", "record": {"id": lid, "state": "pending"}}
+
+    def ledger_complete(self, key: str, state: str, provider_response: str = "") -> None:
+        self.execute(
+            "UPDATE action_ledger SET state=?, provider_response=?, attempts=attempts+1, updated_at=?"
+            " WHERE idempotency_key=?",
+            (state, provider_response, time.time(), key))
+
+    def ledger_get(self, key: str) -> dict | None:
+        r = self.query_one("SELECT * FROM action_ledger WHERE idempotency_key=?", (key,))
+        return dict(r) if r else None
+
+    # -- provider usage (WS6/WS7) --------------------------------------
+    def log_usage(self, provider: str, model: str, input_tokens: int, output_tokens: int,
+                  cost_usd: float, latency_ms: int, status: str = "ok") -> None:
+        self.execute(
+            "INSERT INTO provider_usage (ts,provider,model,input_tokens,output_tokens,cost_usd,latency_ms,status)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (time.time(), provider, model, input_tokens, output_tokens, cost_usd, latency_ms, status))
+
+    def usage_summary(self) -> dict:
+        r = self.query_one(
+            "SELECT COUNT(*) AS calls, COALESCE(SUM(cost_usd),0) AS cost,"
+            " COALESCE(SUM(input_tokens),0) AS in_tok, COALESCE(SUM(output_tokens),0) AS out_tok"
+            " FROM provider_usage")
+        return dict(r) if r else {}
 
     # -- connectors ------------------------------------------------------
     def set_connector(self, name: str, mode: str, detail: str = "") -> None:

@@ -112,22 +112,44 @@ External actions, sensitive information, credentials and consequential operation
 
 ### 🚀 PROJECT STATUS
 
-**v0.1.0 — Phase 0–1 milestone implemented (Nov 2026).**
+**v0.2.0 — Security & reliability engineering (Nov 2026). CONDITIONAL GO (staging) / NOT PRODUCTION READY.**
 
-Working platform: FastAPI backend, SKYLA PRIME COMMAND dashboard, multi-provider
-model gateway with dynamic routing, durable task orchestration with independent
-verification, 5 specialist agents, PRIME KNOWLEDGE (FTS + memory + web research),
-PRIME CONNECT (Gmail / Google Calendar / Telegram, live-ready in mock-safe mode),
-Workflows B–E, sandboxed execution, audit logging, 31 passing tests.
+Working platform: FastAPI backend, SKYLA PRIME COMMAND dashboard with sign-in,
+multi-provider model gateway with dynamic routing, durable task orchestration with
+independent verification, 5 specialist agents, PRIME KNOWLEDGE (FTS + memory + web
+research), PRIME CONNECT (Gmail / Google Calendar / Telegram, mock-safe), Workflows
+B–E, and **100 passing tests**.
+
+v0.2.0 hardening:
+
+- **Genuine execution isolation** — pluggable providers (`namespace`, `container`,
+  `restricted`, `disabled`). The default here is Linux namespace isolation
+  (user/mount/PID/net + `chroot`), adversarially tested for filesystem, network,
+  subprocess, resource-exhaustion and secret-leak attempts. When no secure runtime is
+  available, execution is refused or explicitly labelled *unsafe development only*.
+- **Identity & authorization** — users, PBKDF2 passwords, TOTP MFA, hashed sessions,
+  scoped API tokens, RBAC, per-agent and per-connector permissions, cross-user
+  isolation, attributable audit log. Every protected endpoint enforces this server-side.
+- **Action ledger** — external writes (Gmail drafts, Calendar events, Telegram
+  messages) carry idempotency keys and request fingerprints; duplicates replay the
+  recorded result instead of executing twice.
+- **Context management** — model-specific budgets, instruction-priority fitting,
+  flagged truncation, compaction of older step outputs.
+- **Versioned migrations**, demonstrated backup/recovery, provider usage & cost
+  logging, structured logs with per-request trace ids and secret redaction.
 
 Frontier model calls and live connector operations require provider credentials
-(see `.env.example`). Mock mode is explicit everywhere — never labeled live.
+(see `.env.example`) and remain **NOT VERIFIED** in this build. Mock mode is explicit
+everywhere — never labelled live. Code execution is isolated, not a hardware boundary;
+see `SANDBOX_ARCHITECTURE.md` for the limitations.
 
 **Quick start:**
 ```bash
 pip install -e ".[dev]"
+export SKYLA_ADMIN_PASSWORD='choose-a-strong-password'   # else a one-time credential
+                                                          # is written to data/
 python3 -m uvicorn skyla.api.app:app --host 0.0.0.0 --port 8000
-# Dashboard: http://localhost:8000 · Tests: python3 -m pytest tests/ -q
+# Open http://localhost:8000 and sign in · Tests: python3 -m pytest tests/ -q
 ```
 
 Planned capabilities are not represented as completed functionality. Performance claims will be supported by reproducible evaluation results.

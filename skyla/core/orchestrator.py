@@ -14,6 +14,8 @@ import json
 from ..agents.registry import get_agent
 from ..db import Database
 from ..models.router import ModelRouter
+from ..observability import metrics
+from .context import ContextManager
 from .planner import plan_task
 
 
@@ -47,15 +49,24 @@ class Orchestrator:
                 step_ids[step.idx] = sid
                 self.db.update_step(sid, status="running")
                 agent = get_agent(step.agent)
-                # Gather dependency outputs as context.
-                context = "\n".join(f"[Step {d} output]\n{outputs[d]}"
-                                    for d in step.depends_on if d in outputs)
+                # Gather dependency outputs as context (compacted, budgeted).
+                raw_context = "\n".join(f"[Step {d} output]\n{outputs[d]}"
+                                        for d in step.depends_on if d in outputs)
+                ctx = ContextManager(model_id="skyla-mock-0.1").fit(
+                    system=agent.system_prompt, user=task["instruction"],
+                    context=ContextManager.compact_step_outputs(
+                        [outputs[d] for d in step.depends_on if d in outputs]))
+                context = ctx["context"]
                 result = await agent.execute(
                     instruction=task["instruction"], step_title=step.title,
                     context=context, router=self.router)
                 outputs[step.idx] = result.text
                 total_cost += result.cost_usd
                 model_used = result.model
+                self.db.log_usage(result.provider, result.model, result.input_tokens,
+                                  result.output_tokens, result.cost_usd, result.latency_ms)
+                metrics.inc("agent_calls")
+                metrics.inc("model_cost_micro_usd", int(result.cost_usd * 1_000_000))
                 self.db.update_step(sid, status="completed", output=result.text,
                                     model_used=result.model)
             final_text = outputs.get(len(plan.steps) - 1, "")

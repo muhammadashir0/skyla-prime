@@ -11,9 +11,22 @@
   <div class="brand"><span class="mark">✦</span> SKYLA <b>PRIME</b> <span class="sub">COMMAND</span></div>
   <div class="header-right">
     <span id="health" class="pill">connecting…</span>
-    <input id="token" type="password" placeholder="API token (if set)" autocomplete="off">
+    <span id="whoami" class="pill" hidden></span>
+    <button id="logout-btn" class="ghost" hidden>Sign out</button>
   </div>
 </header>
+
+<div id="login-overlay" class="login-overlay">
+  <form id="login-form" class="login-card" autocomplete="on">
+    <h2>Sign in to SKYLA PRIME</h2>
+    <p class="hint">Session tokens are held in memory only — closing the tab signs you out.</p>
+    <label>Username<input id="login-user" name="username" autocomplete="username" required></label>
+    <label>Password<input id="login-pass" name="password" type="password" autocomplete="current-password" required></label>
+    <label id="mfa-row" hidden>MFA code<input id="login-mfa" name="mfa_code" inputmode="numeric" autocomplete="one-time-code" placeholder="6 digits"></label>
+    <button type="submit" id="login-submit">Sign in</button>
+    <div id="login-error" class="login-error" role="alert"></div>
+  </form>
+</div>
 <nav id="tabs">
   <button data-tab="dashboard" class="active">Dashboard</button>
   <button data-tab="tasks">Tasks</button>
