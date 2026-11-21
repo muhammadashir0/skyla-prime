@@ -231,6 +231,10 @@ class Database:
             "SELECT * FROM memories WHERE value LIKE ? OR key LIKE ? ORDER BY reliability DESC LIMIT ?",
             (f"%{query}%", f"%{query}%", limit))]
 
+    def delete_memory(self, mid: str) -> bool:
+        cur = self.execute("DELETE FROM memories WHERE id=?", (mid,))
+        return cur.rowcount > 0
+
     # -- connectors ------------------------------------------------------
     def set_connector(self, name: str, mode: str, detail: str = "") -> None:
         self.execute(

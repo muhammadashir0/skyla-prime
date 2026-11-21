@@ -61,7 +61,10 @@ class OpenAICompatibleProvider(ModelProvider):
             resp.raise_for_status()
             data = resp.json()
         latency_ms = int((time.time() - t0) * 1000)
-        choice = data["choices"][0]["message"]["content"]
+        try:
+            choice = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Malformed provider response from {self.name}: {exc}") from exc
         usage = data.get("usage", {})
         in_tok = int(usage.get("prompt_tokens", 0))
         out_tok = int(usage.get("completion_tokens", 0))

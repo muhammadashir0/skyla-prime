@@ -14,7 +14,7 @@ skyla/
   agents/            base.py, registry.py (5 specialist agents)
   knowledge/         store.py (FTS5 + memory), research.py (web fetch)
   integrations/      registry.py, gmail.py, calendar.py, telegram.py
-  execution/         sandbox.py (subprocess Python, timeout + rlimits)
+  execution/         sandbox.py (resource-limited subprocess Python — NOT a security boundary; see SECURITY_ARCHITECTURE.md)
   workflows/         operations.py (Workflows B–E)
   api/               app.py (FastAPI, dashboard serving)
 apps/web/static/     Dashboard (index.html, app.js, style.css)

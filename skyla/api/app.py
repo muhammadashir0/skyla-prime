@@ -186,6 +186,15 @@ def recall(q: str, authorization: str | None = Header(None)):
     return knowledge.recall(q)
 
 
+@app.delete("/api/knowledge/memory/{memory_id}")
+def forget(memory_id: str, authorization: str | None = Header(None)):
+    actor = _actor(authorization)
+    if not db.delete_memory(memory_id):
+        raise HTTPException(404, "Memory not found")
+    db.audit(actor, "memory.delete", memory_id)
+    return {"deleted": memory_id}
+
+
 # ---------------------------------------------------------------- execution
 @app.post("/api/execute/python")
 def execute_python(body: CodeRun, authorization: str | None = Header(None)):
@@ -193,6 +202,13 @@ def execute_python(body: CodeRun, authorization: str | None = Header(None)):
     check_autonomy(2, settings.max_autonomy_level)
     result = run_python(body.code, settings.sandbox_timeout_s, settings.sandbox_memory_mb)
     db.audit(actor, "execute.python", f"ok={result['ok']}")
+    # AUDIT (v0.1.0): this is resource-limited execution, NOT a security
+    # sandbox — filesystem/network/subprocess are not blocked. See
+    # docs/SECURITY_ARCHITECTURE.md. Production requires container isolation.
+    result["isolated"] = False
+    result["warning"] = ("Resource-limited execution only (timeout + memory). "
+                         "NOT a security boundary: filesystem, network and "
+                         "subprocess access are not blocked.")
     return result
 
 

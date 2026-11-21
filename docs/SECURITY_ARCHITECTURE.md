@@ -14,9 +14,14 @@
 - **Secrets hygiene:** keys come only from environment variables; never
   logged, never placed in model-visible context (gateway sends only
   system/user prompts).
-- **Sandbox:** subprocess Python with timeout, CPU/memory rlimits,
-  minimal environment, no network. Defense-in-depth for dev; production
-  requires container isolation (Phase 5).
+- **Execution environment (AUDIT-CORRECTED):** subprocess Python with
+  timeout + CPU/memory rlimits + minimal environment. **This is NOT a
+  security sandbox.** Independent audit (2026-11-21) verified that
+  filesystem read/write, network access and subprocess execution are
+  **not blocked**; only memory and timeout limits are enforced. The API
+  response includes `"isolated": false` with a warning. Production use
+  requires container-level isolation (Phase 5) — do not execute untrusted
+  code against this endpoint in production.
 - **Durable state:** tasks/steps persisted; interrupted tasks recovered
   on boot — no silent loss of completed work.
 
