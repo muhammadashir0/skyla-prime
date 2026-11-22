@@ -105,7 +105,58 @@ POLICIES: dict[str, Policy] = {
         allow_hosts=("api.telegram.org",),
         allow_methods=("GET", "POST"),
     ),
+    # Research retrieval is a distinct capability from model inference: one reads
+    # untrusted documents, the other spends money and holds an API key. Separate
+    # policies mean a compromise of the reader does not carry the spender's reach.
+    "model-provider": Policy(
+        name="model-provider",
+        allow_hosts=(
+            "api.openai.com",          # OpenAI-compatible
+            "api.deepseek.com",
+            "dashscope.aliyuncs.com",  # Qwen
+            "api.z.ai",                # GLM
+        ),
+        allow_methods=("GET", "POST"),
+    ),
+    # The union used by the API process, which plays every role at once. Kept as
+    # an explicit union rather than a wildcard so adding a capability is a
+    # deliberate edit to a named policy, not a silent widening.
+    "api-egress": Policy(
+        name="api-egress",
+        allow_hosts=(
+            # research
+            "*.wikipedia.org", "wikipedia.org", "example.com", "*.example.com",
+            # model providers
+            "api.openai.com", "api.deepseek.com", "dashscope.aliyuncs.com", "api.z.ai",
+            # google oauth + gmail + calendar
+            "oauth2.googleapis.com", "www.googleapis.com", "gmail.googleapis.com",
+            "www.google.com", "accounts.googleapis.com", "accounts.google.com",
+            # telegram
+            "api.telegram.org",
+        ),
+        allow_methods=("GET", "HEAD", "POST", "PUT", "PATCH"),
+    ),
 }
+
+
+def policy_for_connector(connector: str) -> Policy:
+    """Map a connector name to its policy, denying by default.
+
+    Used by the client factory so each call is scoped to the capability that
+    needs it. An unknown connector gets `deny-all`, never a permissive default.
+    """
+    name = (connector or "").strip().lower()
+    if name in ("gmail", "calendar", "google", "gmail-connector"):
+        return POLICIES["connector-google"]
+    if name in ("telegram",):
+        return POLICIES["connector-telegram"]
+    if name in ("research", "fetch", "web"):
+        return POLICIES["research"]
+    if name in ("model", "provider", "llm"):
+        return POLICIES["model-provider"]
+    if name in ("api", "api-egress"):
+        return POLICIES["api-egress"]
+    return POLICIES["deny-all"]
 
 
 @dataclass
@@ -162,12 +213,15 @@ class EgressProxy:
     def __init__(self, host: str = "127.0.0.1", port: int = 0,
                  *, policy: Policy | None = None,
                  audit: EgressAudit | None = None,
-                 policy_resolver: Callable[[str], Policy] | None = None):
+                 policy_resolver: Callable[[str], Policy] | None = None,
+                 share_secret: str = "", require_auth: bool = False):
         self.host = host
         self.port = port
         self.default_policy = policy or POLICIES["deny-all"]
         self.audit = audit or EgressAudit()
         self.policy_resolver = policy_resolver
+        self.share_secret = share_secret or os.getenv("SKYLA_EGRESS_SECRET", "")
+        self.require_auth = require_auth or os.getenv("SKYLA_EGRESS_REQUIRE_AUTH", "0") == "1"
         self._server: socketserver.ThreadingTCPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -209,20 +263,84 @@ class EgressProxy:
         self.stop()
 
     # -------------------------------------------------------------- policy
+    def _capability_from(self, headers: dict) -> tuple[str, str]:
+        """Extract the capability from Proxy-Authorization.
+
+        Format: `Basic base64("<capability>:<token>")`. The username names the
+        policy; the password is a shared secret so an arbitrary process on the
+        host cannot borrow a capability by guessing its name. When
+        `require_auth` is set, a missing or wrong credential is denied rather
+        than falling back to the default policy.
+        """
+        raw = headers.get("proxy-authorization", "")
+        if not raw:
+            return "", "" if not self.require_auth else "proxy authentication required"
+        scheme, _, blob = raw.partition(" ")
+        if scheme.lower() != "basic":
+            return "", f"unsupported proxy auth scheme {scheme!r}"
+        try:
+            import base64
+            decoded = base64.b64decode(blob).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return "", "malformed proxy credentials"
+        cap, _, token = decoded.partition(":")
+        cap = cap.strip()
+        if self.share_secret and token != self.share_secret:
+            return "", "invalid proxy credential"
+        valid = set(POLICIES) | {"research", "model-provider", "connector-google",
+                                 "connector-telegram", "api-egress"}
+        if cap not in valid:
+            return "", f"unknown capability {cap!r}"
+        return cap, ""
+
     def _policy_for(self, task_id: str) -> Policy:
         if self.policy_resolver:
             return self.policy_resolver(task_id)
         return self.default_policy
 
     def authorise(self, host: str, port: int, method: str = "GET",
-                  task_id: str = "") -> tuple[bool, str, str]:
+                  task_id: str = "", capability: str = "") -> tuple[bool, str, str]:
         """Decide whether a destination may be contacted. Returns (ok, reason, ip).
 
         Order matters: policy first (cheap, and denies most things without doing
         any DNS work), then resolution, then IP classification.
         """
         policy = self._policy_for(task_id)
+        if capability:
+            # A named capability is authoritative: the request is judged by that
+            # policy and nothing else. No fan-out, no union.
+            declared = POLICIES.get(capability) or policy_for_connector(capability)
+            if not declared.host_permitted(host):
+                return False, (f"host '{host}' not permitted for capability "
+                               f"'{declared.name}'"), ""
+            if port not in declared.allow_ports:
+                return False, f"port {port} not permitted for '{declared.name}'", ""
+            if method.upper() != "CONNECT" and method.upper() not in declared.allow_methods:
+                return False, f"method {method} not permitted for '{declared.name}'", ""
+            try:
+                vetted = validate_url(
+                    f"https://{host}:{port}/" if port in (443, 8443)
+                    else f"http://{host}:{port}/",
+                    allowed_ports=set(declared.allow_ports))
+            except SSRFBlocked as exc:
+                return False, f"address check failed: {exc}", ""
+            return True, f"allowed by capability '{declared.name}'", vetted.ip
         if not policy.host_permitted(host):
+            # One proxy serves several capabilities (research, model providers,
+            # Google, Telegram) because the API is a single process. Rather than
+            # run four listeners — four bind addresses to get wrong — a host that
+            # the *default* policy would allow is permitted when an explicitly
+            # named per-capability policy allows it. The union is the named
+            # `api-egress` policy's host list, so this cannot widen silently: a
+            # destination still has to appear in a reviewed policy.
+            if self.default_policy.name in ("api-egress", "multi-capability"):
+                for alt_name in ("research", "model-provider", "connector-google",
+                                 "connector-telegram"):
+                    alt = POLICIES.get(alt_name)
+                    if alt and alt.host_permitted(host) and port in alt.allow_ports \
+                            and (method.upper() == "CONNECT"
+                                 or method.upper() in alt.allow_methods):
+                        return True, f"allowed by '{alt_name}'", ""
             return False, f"host '{host}' not in policy '{policy.name}'", ""
         if port not in policy.allow_ports:
             return False, f"port {port} not permitted", ""
@@ -263,11 +381,24 @@ class EgressProxy:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
         task_id = headers.get("x-skyla-task", "")
+        # The client factory stamps every request with the capability it was
+        # built for. The proxy enforces that capability's policy alone, so a
+        # research client cannot reach a model provider and a connector cannot
+        # reach an arbitrary host, even though both use the same listener.
+        # Capability travels in Proxy-Authorization, not a custom header.
+        # Measured: httpx forwards only `host` and `accept` on a CONNECT request,
+        # so a custom header never reaches the proxy for HTTPS — the capability
+        # would be silently unknown exactly where it matters. Proxy-Authorization
+        # is part of the CONNECT handshake and survives.
+        capability, auth_reason = self._capability_from(headers)
+        if not auth_reason and not capability:
+            capability = headers.get("x-skyla-capability", "").strip()
 
         if method.upper() == "CONNECT":
-            self._handle_connect(conn, target, task_id, rest)
+            self._handle_connect(conn, target, task_id, rest, capability)
         else:
-            self._handle_forward(conn, method, target, headers, rest, task_id)
+            self._handle_forward(conn, method, target, headers, rest, task_id,
+                                 capability)
 
     @staticmethod
     def _read_headers(conn: socket.socket) -> bytes:
@@ -296,7 +427,7 @@ class EgressProxy:
             pass
 
     def _handle_connect(self, conn: socket.socket, target: str,
-                        task_id: str, rest: bytes) -> None:
+                        task_id: str, rest: bytes, capability: str = "") -> None:
         host, _, port_s = target.partition(":")
         try:
             port = int(port_s or "443")
@@ -308,7 +439,7 @@ class EgressProxy:
             self._deny(conn, host, port, "CONNECT",
                        f"CONNECT not allowed by policy '{policy.name}'", task_id)
             return
-        ok, reason, ip = self.authorise(host, port, "CONNECT", task_id)
+        ok, reason, ip = self.authorise(host, port, "CONNECT", task_id, capability)
         if not ok:
             self._deny(conn, host, port, "CONNECT", reason, task_id)
             return
@@ -333,7 +464,8 @@ class EgressProxy:
             except OSError:
                 pass
 
-    def _handle_forward(self, conn, method, target, headers, rest, task_id) -> None:
+    def _handle_forward(self, conn, method, target, headers, rest, task_id,
+                        capability: str = "") -> None:
         parts = urlsplit(target)
         host = parts.hostname or headers.get("host", "").split(":")[0]
         port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -341,7 +473,7 @@ class EgressProxy:
             self._deny(conn, host, port, method,
                        "proxy requires absolute-form request target", task_id)
             return
-        ok, reason, ip = self.authorise(host, port, method, task_id)
+        ok, reason, ip = self.authorise(host, port, method, task_id, capability)
         if not ok:
             self._deny(conn, host, port, method, reason, task_id)
             return

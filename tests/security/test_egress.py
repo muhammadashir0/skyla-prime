@@ -183,7 +183,7 @@ def test_every_decision_is_audited(proxy):
     # attempted, which is the correct place to record it. Use a destination that
     # refuses the TCP connect so the ALLOW path is exercised cheaply.
     class _Refusing(EgressProxy):
-        def authorise(self, host, port, method="GET", task_id=""):
+        def authorise(self, host, port, method="GET", task_id="", capability=""):
             return True, "allowed", "127.0.0.1"
 
     p = _Refusing(policy=Policy(name="allow", allow_hosts=("pypi.org",),

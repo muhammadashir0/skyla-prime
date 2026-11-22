@@ -32,20 +32,16 @@ def test_provider_success_and_usage():
 
     usage = []
     p = _provider(handler, lambda *a: usage.append(a))
-    # monkeypatch client construction to use mock transport
-    orig = httpx.AsyncClient
-
-    class C(orig):
-        def __init__(self, *a, **kw):
-            kw["transport"] = httpx.MockTransport(handler)
-            super().__init__(*a, **kw)
-
+    # The provider now builds clients through skyla.egress_client.client(), so that
+    # is the seam to patch. Injecting a MockTransport never opens a socket.
     import skyla.models.http_provider as hp
-    hp.httpx.AsyncClient = C
+    orig = hp.egress_client
+    hp.egress_client = lambda *a, **kw: orig(
+        *a, **{**kw, "transport": httpx.MockTransport(handler)})
     try:
         result = asyncio.run(p.chat(_req()))
     finally:
-        hp.httpx.AsyncClient = orig
+        hp.egress_client = orig
     assert result.text == "hi"
     assert result.input_tokens == 10
     assert usage and usage[0][2] == 10  # usage callback fired
@@ -69,18 +65,13 @@ def test_provider_retry_on_429():
 
     p = _provider(handler)
     import skyla.models.http_provider as hp
-    orig = hp.httpx.AsyncClient
-
-    class C(orig):
-        def __init__(self, *a, **kw):
-            kw["transport"] = httpx.MockTransport(handler)
-            super().__init__(*a, **kw)
-
-    hp.httpx.AsyncClient = C
+    orig = hp.egress_client
+    hp.egress_client = lambda *a, **kw: orig(
+        *a, **{**kw, "transport": httpx.MockTransport(handler)})
     try:
         result = asyncio.run(p.chat(_req()))
     finally:
-        hp.httpx.AsyncClient = orig
+        hp.egress_client = orig
     assert result.text == "ok"
     assert attempts["n"] == 3
 
@@ -91,20 +82,15 @@ def test_provider_error_normalization():
 
     p = _provider(handler)
     import skyla.models.http_provider as hp
-    orig = hp.httpx.AsyncClient
-
-    class C(orig):
-        def __init__(self, *a, **kw):
-            kw["transport"] = httpx.MockTransport(handler)
-            super().__init__(*a, **kw)
-
-    hp.httpx.AsyncClient = C
+    orig = hp.egress_client
+    hp.egress_client = lambda *a, **kw: orig(
+        *a, **{**kw, "transport": httpx.MockTransport(handler)})
     try:
         with pytest.raises(ProviderError) as exc:
             asyncio.run(p.chat(_req()))
         assert exc.value.status == 401
     finally:
-        hp.httpx.AsyncClient = orig
+        hp.egress_client = orig
 
 
 def test_metrics_snapshot():

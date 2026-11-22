@@ -11,6 +11,7 @@ import asyncio
 import time
 
 import httpx
+from ..egress_client import client as egress_client
 
 from .base import ChatRequest, ChatResult, ModelProvider
 
@@ -54,7 +55,7 @@ class OpenAICompatibleProvider(ModelProvider):
         if not self.available:
             return {"provider": self.name, "status": "NOT_CONFIGURED"}
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with egress_client("model-provider", timeout=15) as client:
                 resp = await client.get(f"{self.base_url}/models",
                                         headers={"Authorization": f"Bearer {self.api_key}"})
                 if resp.status_code == 401:
@@ -84,7 +85,7 @@ class OpenAICompatibleProvider(ModelProvider):
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                async with httpx.AsyncClient(timeout=120) as client:
+                async with egress_client("model-provider", timeout=120) as client:
                     resp = await client.post(
                         f"{self.base_url}/chat/completions", json=payload,
                         headers={"Authorization": f"Bearer {self.api_key}"})

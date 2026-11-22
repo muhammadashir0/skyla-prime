@@ -93,8 +93,14 @@ root, port = sys.argv[1], int(sys.argv[2])
 sys.path.insert(0, root)
 from skyla.egress import EgressProxy, POLICIES
 os.environ["SKYLA_EGRESS_BIND"] = "10.201.0.1"
-policy = POLICIES[os.getenv("SKYLA_EGRESS_POLICY", "research")]
-p = EgressProxy(host="10.201.0.1", port=port, policy=policy).start()
+# api-egress as the default: the capability in Proxy-Authorization is what
+# actually decides each request, so the default policy only needs to be the
+# union the API legitimately uses. require_auth makes an unstamped request a
+# denial instead of a silent fall-through to this policy.
+policy = POLICIES[os.getenv("SKYLA_EGRESS_POLICY", "api-egress")]
+secret = os.getenv("SKYLA_EGRESS_SECRET", "")
+p = EgressProxy(host="10.201.0.1", port=port, policy=policy,
+                share_secret=secret, require_auth=True).start()
 print(f"egress proxy on {p.host}:{p.port} policy={policy.name} "
       f"(reachable from the workload as 10.200.0.1:{port})", flush=True)
 try:

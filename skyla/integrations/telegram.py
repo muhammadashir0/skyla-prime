@@ -5,6 +5,7 @@ mock mode (messages are logged, not sent).
 from __future__ import annotations
 
 import httpx
+from ..egress_client import client as egress_client
 
 from ..config import get_settings
 
@@ -28,7 +29,7 @@ class TelegramConnector:
         if not self.live:
             return {"mode": "mock", "chat_id": chat_id, "text": text,
                     "status": "logged-not-sent"}
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-telegram", timeout=30) as client:
             resp = await client.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={"chat_id": chat_id, "text": text})
@@ -38,7 +39,7 @@ class TelegramConnector:
     async def get_me(self) -> dict:
         if not self.live:
             return {"mode": "mock", "bot": "skyla-prime-mock-bot"}
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-telegram", timeout=30) as client:
             resp = await client.get(f"https://api.telegram.org/bot{self.token}/getMe")
             resp.raise_for_status()
             return {"mode": "live", "result": resp.json()}

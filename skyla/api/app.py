@@ -20,6 +20,7 @@ from ..core.orchestrator import Orchestrator
 from ..core.planner import plan_task
 from ..db import MIGRATIONS, Database
 from ..dbguard import DatabaseIntegrityError, enforce as enforce_db
+from ..egress_client import EgressUnavailable, startup_check as egress_startup_check
 from ..execution.providers import get_execution_provider
 from ..integrations.calendar import GoogleCalendarConnector
 from ..integrations.gmail import GmailConnector
@@ -49,6 +50,17 @@ try:
     )
 except DatabaseIntegrityError as exc:  # fail closed, loudly, before serving
     raise RuntimeError(f"SKYLA PRIME refused to start: {exc}") from exc
+
+# B-01: establish the outbound path BEFORE serving. In enforce mode this proves
+# the process is inside the perimeter and that a direct connection fails; if it
+# is not, the API refuses to start rather than serving with unconstrained
+# egress. Set SKYLA_EGRESS_MODE=policy to run without a namespace (developer
+# machines), or legacy only where no perimeter is installed.
+try:
+    EGRESS_CONFIRMATION = egress_startup_check()
+except EgressUnavailable as exc:  # fail closed, loudly, before serving
+    raise RuntimeError(f"SKYLA PRIME refused to start: {exc}") from exc
+log.info("egress route confirmed: %s", EGRESS_CONFIRMATION)
 
 db = Database(settings.db_path)
 

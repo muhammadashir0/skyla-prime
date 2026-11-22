@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import httpx
+from ..egress_client import client as egress_client
 
 from ..config import get_settings
 
@@ -29,7 +30,7 @@ class GoogleCalendarConnector:
         self._s = s
 
     async def _access_token(self) -> str:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-google", timeout=30) as client:
             resp = await client.post(
                 "https://oauth2.googleapis.com/token",
                 data={"client_id": self._s.google_oauth_client_id,
@@ -48,7 +49,7 @@ class GoogleCalendarConnector:
             params["timeMin"] = time_min
         if time_max:
             params["timeMax"] = time_max
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-google", timeout=30) as client:
             resp = await client.get(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events",
                 params=params, headers={"Authorization": f"Bearer {token}"})
@@ -65,7 +66,7 @@ class GoogleCalendarConnector:
         body = {"summary": summary, "start": {"dateTime": start}, "end": {"dateTime": end}}
         if attendees:
             body["attendees"] = [{"email": a} for a in attendees]
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-google", timeout=30) as client:
             resp = await client.post(
                 "https://www.googleapis.com/calendar/v3/calendars/primary/events",
                 json=body, headers={"Authorization": f"Bearer {token}"})

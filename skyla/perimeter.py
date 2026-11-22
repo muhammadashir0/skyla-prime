@@ -478,7 +478,71 @@ class EgressPerimeter:
             return {"error": (r["stderr"] or r["stdout"])[:200]}
 
     # -------------------------------------------------------------- destroy
-    def destroy(self, *, quiet: bool = False) -> None:
+    def members(self) -> list[int]:
+        """PIDs whose network namespace is this perimeter's workload namespace.
+
+        Found because destroying the perimeter does NOT kill or detach the
+        processes inside it: they stay pinned to the *deleted* namespace, keep
+        running, and silently lose their only route. Measured on a live API
+        process: after a rebuild, `ip -brief addr` inside its namespace showed
+        `lo` and nothing else, every connect returned ENETUNREACH, and the process
+        still looked healthy from the outside. That is the worst failure shape —
+        a service that appears up and cannot reach anything, with no error until
+        a protected operation is attempted.
+        """
+        if not shutil.which("ip"):
+            return []
+        target = Path(f"/var/run/netns/{self.name}")
+        try:
+            want = os.stat(target).st_ino
+        except OSError:
+            return []
+        pids: list[int] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if os.stat(f"/proc/{entry.name}/ns/net").st_ino == want:
+                    pids.append(int(entry.name))
+            except OSError:
+                continue
+        return pids
+
+    def destroy(self, *, quiet: bool = False, kill_members: bool = True) -> None:
+        """Tear down the perimeter.
+
+        Refuses to strand live processes: by default it terminates anything still
+        inside the namespace first. `kill_members=False` leaves them alone, which
+        is what a test or an operator inspecting a live namespace wants — but the
+        caller is then responsible for knowing they will be orphaned, and the
+        reason records it.
+        """
+        stranded = self.members()
+        if stranded and kill_members:
+            import signal
+            for pid in stranded:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            deadline = time.time() + 5
+            while time.time() < deadline and self.members():
+                time.sleep(0.2)
+            for pid in self.members():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        stranded_warning = ""
+        if stranded and not kill_members:
+            # The warning must SURVIVE the generic "destroyed" reason below:
+            # telling an operator "destroyed" while live processes are silently
+            # cut off from the network is exactly the reassuring-and-wrong signal
+            # this milestone exists to remove.
+            stranded_warning = (
+                f"{len(stranded)} process(es) remain inside {self.name!r} and will "
+                f"lose all network reachability when it is removed")
+
         if shutil.which("ip"):
             for ns in (self.name, self.gateway_name):
                 _run(["ip", "netns", "del", ns], check=False)
@@ -490,7 +554,7 @@ class EgressPerimeter:
         self._created = False
         self.status.available = False
         if not quiet:
-            self.status.reason = "destroyed"
+            self.status.reason = stranded_warning or "destroyed"
 
     def __enter__(self):
         return self.create()

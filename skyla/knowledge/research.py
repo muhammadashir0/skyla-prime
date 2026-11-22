@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 import httpx
+from ..egress_client import client as egress_client
 
 from ..config import get_settings
 from ..netguard import SSRFBlocked, validate_url
@@ -30,10 +31,14 @@ async def fetch_url(url: str, max_redirects: int = 3) -> dict:
     s = get_settings()
     current = url
     hops = 0
-    async with httpx.AsyncClient(
+    # Routed through the egress gateway (B-01): `validate_url` below is an
+    # application-level check and was never sufficient on its own — the proxy
+    # re-resolves and re-vets at connect time, and the namespace makes a direct
+    # dial impossible.
+    async with egress_client(
+        "research",
         timeout=s.research_timeout_s,
         headers={"User-Agent": s.research_user_agent},
-        follow_redirects=False,
     ) as client:
         while True:
             vetted = validate_url(current)          # resolves + vets this hop

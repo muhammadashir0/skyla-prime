@@ -7,6 +7,7 @@ mock data so workflows can be tested end-to-end.
 from __future__ import annotations
 
 import httpx
+from ..egress_client import client as egress_client
 
 from ..config import get_settings
 
@@ -38,7 +39,7 @@ class GmailConnector:
         self._s = s
 
     async def _access_token(self) -> str:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-google", timeout=30) as client:
             resp = await client.post(
                 "https://oauth2.googleapis.com/token",
                 data={"client_id": self._s.google_oauth_client_id,
@@ -53,7 +54,7 @@ class GmailConnector:
             return [m for m in MOCK_MESSAGES
                     if query.lower() in (m["subject"] + m["snippet"] + m["from"]).lower()][:max_results]
         token = await self._access_token()
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-google", timeout=30) as client:
             resp = await client.get(
                 "https://gmail.googleapis.com/gmail/v1/users/me/messages",
                 params={"q": query, "maxResults": max_results},
@@ -73,7 +74,7 @@ class GmailConnector:
             return {"mode": "mock", "message_id": message_id, "draft_body": body,
                     "status": "draft-prepared-not-sent"}
         token = await self._access_token()
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with egress_client("connector-google", timeout=30) as client:
             resp = await client.post(
                 "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
                 json={"message": {"raw": body}},
