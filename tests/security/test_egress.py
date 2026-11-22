@@ -215,6 +215,15 @@ def test_audit_log_persists_to_disk(tmp_path):
 
 
 # --------------------------------------------------- per-task policy isolation
+def _egress_allowed_for(host: str) -> bool:
+    r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                        "--max-time", "10", f"https://{host}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "200"
+
+
+@pytest.mark.skipif(not _egress_allowed_for("pypi.org"),
+                    reason="host cannot reach pypi.org (egress allowlist or host firewall)")
 def test_per_task_policy_is_applied():
     """Mission 3: 'per-task access policy'. One task's allowlist must not leak
     into another's."""
@@ -234,13 +243,6 @@ def test_per_task_policy_is_applied():
 
 
 # ------------------------------------------------ live egress (controllable)
-def _egress_allowed_for(host: str) -> bool:
-    r = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                        "--max-time", "10", f"https://{host}"],
-                       capture_output=True, text=True)
-    return r.stdout.strip() == "200"
-
-
 @pytest.mark.skipif(not _egress_allowed_for("pypi.org"),
                     reason="sandbox egress allowlist blocks pypi.org")
 def test_live_https_through_proxy_succeeds_for_authorised_host():

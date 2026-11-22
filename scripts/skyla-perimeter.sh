@@ -56,7 +56,7 @@ print("\nhost_has_network:", proof["host_has_network"])
 print("leaked           :", proof["leaked"])
 print("ISOLATED         :", proof["isolated"])
 if not proof["isolated"]:
-    print("PERIMETER FAILED: traffic escaped the namespace")
+    print("PERIMETER FAILED:", proof.get("reason") or "traffic escaped the namespace")
     raise SystemExit(1)
 print("\nperimeter established and proven")
 EOF

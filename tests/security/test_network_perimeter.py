@@ -422,3 +422,44 @@ def test_proxy_defaults_to_loopback_when_no_perimeter_is_installed(monkeypatch):
     monkeypatch.delenv("SKYLA_EGRESS_BIND", raising=False)
     E.proxy_from_env()
     assert seen["host"] == "127.0.0.1"
+
+
+# ------------------------------- the control gates the conclusion (v0.2.4)
+def test_a_failed_host_control_means_isolation_is_not_proven(monkeypatch):
+    """`ISOLATED: True` next to `host_has_network: False` is a contradiction.
+
+    Measured live after an environment reset: a NameError in the host-control
+    loop (socket used without a module import) made every control target report
+    an error, while the inside-probe correctly reported nothing getting out. The
+    output said both "ISOLATED: True" and "host_has_network: False" — and the
+    reassuring line is the one a reader takes away. If the host cannot reach a
+    destination, a blocked result from inside proves nothing about the perimeter.
+    """
+    p = EgressPerimeter("whatever")
+    monkeypatch.setattr(p, "run_probe",
+                        lambda *a, **k: {"returncode": 0, "stderr": "",
+                                         "stdout": '{"public_dns": "OSError"}'})
+    # Force every host-side connect to fail, as a broken control loop would.
+    monkeypatch.setattr("skyla.perimeter.socket.create_connection",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("control down")))
+    proof = p.prove_no_egress()
+    assert proof["host_has_network"] is False
+    assert proof["isolated"] is False, "isolation was claimed without a working control"
+    assert "cannot be distinguished" in proof["reason"].lower() or proof["reason"]
+
+
+def test_the_probe_does_not_include_a_meaningless_loopback_target():
+    """`127.0.0.1:80` fails on any normal host, so it proves nothing either way."""
+    from skyla.perimeter import _PROBE_TARGETS
+    assert not any(host == "127.0.0.1" for host, _ in _PROBE_TARGETS.values()), \
+        f"loopback in the control set is not a network control: {_PROBE_TARGETS}"
+
+
+def test_perimeter_module_can_run_its_own_control_probe():
+    """Regression: `socket` was used in the host-control loop but never imported.
+
+    It surfaced as NameError for every target, which the control then read as
+    "host has no network" — turning a code defect into a false isolation claim.
+    """
+    import skyla.perimeter as perim
+    assert hasattr(perim, "socket")

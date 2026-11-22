@@ -81,6 +81,7 @@ import ipaddress
 import json
 import os
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -108,7 +109,11 @@ _PROBE_TARGETS = {
     "public_dns2": ("8.8.8.8", 53),
     "metadata_aws": ("169.254.169.254", 80),
     "metadata_gcp": ("169.254.169.254", 80),
-    "loopback_host": ("127.0.0.1", 80),
+    # NOTE: no loopback target here. `127.0.0.1:80` is not a host-network control:
+    # nothing listens there on a normal host, so it "fails" whether or not the host
+    # has network, proving nothing. Loopback isolation is tested separately by
+    # `test_workload_loopback_is_its_own_not_the_hosts`, which starts its own
+    # listener on both sides.
 }
 
 
@@ -441,15 +446,32 @@ class EgressPerimeter:
         # measured means measured, otherwise report the failure and say so.
         measured = not (len(ns_result) == 1 and "error" in ns_result)
         leaked = [k for k, v in ns_result.items() if v == "REACHED"]
+        host_has_network = any(v == "REACHED" for v in host_result.values())
+
+        # The control gates the conclusion, not just the report. Without a
+        # reachable destination on the unconfined side, "nothing got out from
+        # inside" is equally explained by the host having no network — so it is
+        # NOT isolation. An earlier version printed `ISOLATED: True` next to
+        # `host_has_network: False`; the two lines contradicted each other and the
+        # reassuring one was the one a reader would take away. Measured live
+        # during a transient control failure after an environment reset.
+        reason = ""
+        if not measured:
+            reason = f"probe did not run: {ns_result.get('error', '')}"[:200]
+        elif not host_has_network:
+            unreachable = [k for k, v in host_result.items() if v != "REACHED"]
+            reason = (f"host control unreachable for {unreachable} — a blocked "
+                      f"result from inside cannot be distinguished from the host "
+                      f"having no network, so isolation is NOT proven")[:240]
         return {
             "namespace": self.name,
             "inside": ns_result,
             "host_control": host_result,
             "leaked": leaked,
-            "isolated": bool(measured and not leaked and ns_result),
+            "isolated": bool(measured and host_has_network and not leaked and ns_result),
             "measured": measured,
-            "reason": "" if measured else f"probe did not run: {ns_result.get('error', '')}"[:200],
-            "host_has_network": any(v == "REACHED" for v in host_result.values()),
+            "reason": reason,
+            "host_has_network": host_has_network,
         }
 
     def prove_proxy_reachable(self, timeout: int = 25) -> dict:
