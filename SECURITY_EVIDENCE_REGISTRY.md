@@ -335,3 +335,168 @@ Appended rows only. Historical totals (§I) are unchanged and still refer to `5b
 NET-23 moves from FAIL to PASS **for this host**. It does not move to PASS for production, because the
 release rule requires the firewall where the threat model demands it *and* second-host validation, and the
 second host is still missing.
+ssing.
+
+---
+
+# v0.2.5 EXTENSION — appended, nothing above modified
+
+Sections A–I (v0.2.3) and J–O (v0.2.4) are unchanged. `git diff` for this commit shows **0 deletions** in
+this file, which is the mechanical proof of append-only.
+
+**v0.2.5 host:** `e2b.local`, Debian 12, kernel 6.1.158+, 2 vCPU, 3939 MB, cgroup v2 delegated,
+Landlock ABI 2, Python 3.11.2
+
+**Repro shorthand**
+- `SUITE25` = `python -m pytest -q` → **385 passed / 42 skipped**
+- `SUITE25D` = run as the service user inside `/sys/fs/cgroup/skyla/service` → **406 passed / 21 skipped**
+- `CGBOOT` = `sudo scripts/cgroup_bootstrap.sh`
+- `ISO` = `python -m pytest tests/security/test_local_execution_isolation.py -q`
+- `MUT25` = `python -m pytest tests/security/test_execution_mutation_v025.py -q`
+
+---
+
+## P. Local execution isolation (v0.2.5 mission A — EXEC-01)
+
+| ID | Claim | Impl | Test | Repro | Expected | Actual | Mutation | Status |
+|---|---|---|---|---|---|---|---|---|
+| EXE-01 | Local execution cannot inherit host networking | `sandbox.py` | `test_a_local_workload_cannot_reach_the_network` (8 vectors) | `ISO` | all blocked | all blocked | remove `-n` → detected | **PASS** |
+| EXE-02 | No default route in the sandbox namespace | `sandbox.py` | `test_the_sandbox_namespace_has_no_default_route` | `ISO` | no `00000000` | none | add route → detected | **PASS** |
+| EXE-03 | Isolation verified before execution | `sandbox.run_python` | `test_an_unverifiable_boundary_refuses_execution` | `ISO` | refuse | refused, empty stdout | no-op guard → detected | **PASS** |
+| EXE-04 | Positive control required | `_host_control_ok` | `test_a_failed_host_control_refuses_execution` | `ISO` | refuse | refused | — | **PASS** |
+| EXE-05 | Reachable deny target ⇒ refusal | `_assert_isolated` | `test_a_reachable_target_refuses_execution` | `ISO` | refuse | refused | — | **PASS** |
+| EXE-06 | `network=True` refused by both providers | `providers.py` | `test_the_local_provider_refuses_network_enabled_execution` | `ISO` | refuse | refused | — | **PASS** |
+| EXE-07 | Restricted provider not advertised as fully contained | `providers.py` | `test_the_local_provider_does_not_claim_to_be_safe_for_untrusted_code` | `ISO` | `False` | `False` | — | **PASS** |
+| EXE-08 | Local isolation independent of firewall state | `sandbox.py` | `test_local_isolation_does_not_depend_on_the_host_firewall_state` | `ISO` | isolated in both states | isolated | — | **PASS** |
+| EXE-09 | seccomp / Landlock / PID-kill in the restricted provider | — | — | — | present | **absent** | — | **NOT VERIFIED** (EXEC-02, by design) |
+
+## Q. Cgroup delegation and enforcement (mission B / C)
+
+| ID | Claim | Impl | Test | Repro | Expected | Actual | Status |
+|---|---|---|---|---|---|---|---|
+| CG-01 | Delegation works unprivileged after bootstrap | `cgroup_bootstrap.sh` | `test_cgroups.py` | `CGBOOT` then `SUITE25D` | subtree owned by service user | `/sys/fs/cgroup/skyla` → `user:user` | **PASS** |
+| CG-02 | 18 previously-skipped tests now execute | — | `test_cgroups.py` | `SUITE25D` | 18 passed | **18 passed** | **PASS** |
+| CG-03 | `memory.max` enforced | `cgroups.py` | `test_cgroups.py` | `SUITE25D` | OOM at limit | peak **128.0 MB** of 128 MB | **PASS** |
+| CG-04 | `pids.max` enforced | `cgroups.py` | same | same | stop at limit | stopped at **11** of 50 | **PASS** |
+| CG-05 | `cpu.max` enforced | `cgroups.py` | same | same | quota set | `50000 100000` | **PASS** |
+| CG-06 | Aggregate ceiling enforced | `cgroups.py` | same | same | under 1024 MB | **601 MB** | **PASS** |
+| CG-07 | Failed write never yields `enabled: true` | `cgroups.py` | `test_failed_cgroup_write_refuses_execution` | `MUT25` | raise | raised | **PASS** |
+| CG-08 | `cgroup.kill` terminates the tree | `cgroups.py` | `test_cgroups.py` | `SUITE25D` | `populated 0` | `populated 0` | **PASS** |
+| CG-09 | `memory.swap.max` supported and applied | `cgroups.py` | same | same | `0` | `0` | **PASS** |
+| CG-10 | Disk / IO quota | — | — | — | enforced | **no `io.max` configured** | **NOT VERIFIED** |
+
+### Launcher defect found and fixed
+
+| ID | Finding | Consequence | Fixed |
+|---|---|---|---|
+| CG-11 | `skyla-run.sh` used `[ -w cgroup.procs ]`, which returns success on cgroupfs while the write returns `EPERM`; the error was discarded by `|| true` | the service launched unplaced while appearing to succeed → 18 tests skipped on a host where delegation worked | **yes** — placement now confirmed from `/proc/self/cgroup` |
+
+## R. Process-tree containment (mission D)
+
+| ID | Claim | Impl | Repro | Expected | Actual | Status |
+|---|---|---|---|---|---|---|
+| PT-01 | No descendant survives termination | `workload.py` + `cgroups.py` | `PROCESS_TREE_CONTAINMENT_REPORT.md` §2 | 0 remaining | **0 remaining** (25 killed) | **PASS** |
+| PT-02 | Double-fork + `setsid` contained | both | same | terminated | terminated | **PASS** |
+| PT-03 | Process-group escape contained | both | same | contained | contained | **PASS** |
+| PT-04 | Timeout terminates the tree | `run_isolated` | same | terminated | terminated | **PASS** |
+| PT-05 | Simultaneous workloads cannot kill each other | per-job cgroups | `AGGREGATE_RESOURCE_TESTS.md` | no cross-kills | none observed | **PASS** |
+| PT-06 | API restart during execution | — | — | descendants cleaned | **not exercised** | **NOT VERIFIED** |
+
+## S. Aggregate host protection (mission E)
+
+| ID | Claim | Repro | Expected | Actual | Status |
+|---|---|---|---|---|---|
+| AGG-01 | Admission control refuses overcommit | `AGGREGATE_RESOURCE_TESTS.md` §2 | refuse | 2 of 4 refused | **PASS** |
+| AGG-02 | Aggregate memory stays under ceiling | same | ≤1024 MB | **601 MB** | **PASS** |
+| AGG-03 | API responsive under saturation | same §4 | p99 < 1 s | **p99 15 ms**, 200 OK | **PASS** |
+| AGG-04 | Kernel enforcement, not only a semaphore | `CGROUP_ENFORCEMENT_REPORT.md` §2 | both layers | both evidenced | **PASS** |
+| AGG-05 | Large output generation bounded | — | bounded | only `RLIMIT_FSIZE` exercised | **NOT VERIFIED** |
+| AGG-06 | Disk exhaustion bounded | — | bounded | **no test, no `io.max`** | **NOT VERIFIED** |
+
+## T. Firewall regression (mission F)
+
+| ID | Claim | Repro | Expected | Actual | Status |
+|---|---|---|---|---|---|
+| FW-01 | Default deny intact | `sudo scripts/skyla-host-firewall.sh verify` | blocked | blocked | **PASS** |
+| FW-02 | IPv6 denied | same | blocked | blocked | **PASS** |
+| FW-03 | Rollback restores prior state | `rollback` | `ACCEPT` | restored | **PASS** |
+| FW-04 | Persistence intact | `/etc/skyla-firewall.v4` | valid | valid, unit enabled | **PASS** |
+| FW-05 | Proxy capability enforcement intact | CONNECT probe | wrong capability denied | denied | **PASS** |
+| FW-06 | **Authorised egress reaches upstream** | `HOST_FIREWALL_REGRESSION.md` §3 | 200 | **403 upstream unreachable** | **FAIL** |
+| FW-07 | Firewall and proxy can both be satisfied | same | yes | **mutually exclusive on this kernel** | **FAIL** |
+
+### FW-01 finding
+
+The egress proxy runs in the **host** namespace, so `SKYLA-EGRESS` governs its own upstream connections and
+none of the chain's exceptions match them. With the firewall active, every authorised `CONNECT` fails with
+`upstream unreachable`; with it rolled back, the same request returns `200 Connection Established`.
+
+Attempted fixes: `-m owner` (unsupported — no `xt_owner`), running the proxy in the gateway netns (that
+namespace has no internet route), destination allowlisting (brittle, defeats the purpose).
+
+It fails **closed** — nothing leaks; remote providers are simply unreachable. The specified fix for a host
+with `xt_owner` is one rule before the terminal `DROP`:
+`-A SKYLA-EGRESS -m owner --uid-owner <proxy_uid> -j ACCEPT`.
+
+## U. Mutation summary (mission G)
+
+**8 mutations, 8 detected.** Each names the assertion that caught it; "an unrelated test failed" was not
+accepted as detection.
+
+| # | Mutation | Caught by |
+|---|---|---|
+| 1 | Remove the local network namespace | `test_removing_the_local_namespace_is_detected` |
+| 2 | Restore host network inheritance | `test_restoring_host_network_inheritance_is_detected` |
+| 3 | Add a default route | `test_adding_a_default_route_is_detected` |
+| 4 | Disable socket/isolation restrictions | `test_disabling_the_isolation_assertion_is_detected` |
+| 5 | Report isolation after failed verification | `test_reporting_isolation_after_failure_is_detected` |
+| 6 | Remove a per-job memory limit | `test_removing_a_per_job_memory_limit_is_detected` |
+| 7 | Ignore failed cgroup writes | `test_failed_cgroup_write_refuses_execution` |
+| 8 | Disable process-tree cleanup | `test_disabling_process_tree_cleanup_is_detected` |
+
+## V. Test accounting — every skip explained
+
+`SUITE25D` = **406 passed / 21 skipped**.
+
+| Count | Reason | Production significance |
+|---|---|---|
+| 9 | namespace entry needs `CAP_SYS_ADMIN` | **compensated** — measured manually as root; perimeter `verify` → `isolated: True`, leaked `[]` |
+| 6 | API egress tests need `CAP_SYS_ADMIN` | **compensated** — capability sweep measured manually |
+| 2 | real internet reachability, now denied by the firewall | **expected** — correct default-deny makes these impossible |
+| 1 | absent-namespace path cannot be exercised while the namespace exists | not significant |
+| 3 | cgroup mutations need placement (unprivileged run only) | **not applicable** — they pass in `SUITE25D` |
+| **21** | | |
+
+**No skip is counted as a pass.** The 12 CAP_SYS_ADMIN skips are the only ones where a real control exists
+that the automated test cannot reach; both groups were verified manually and the commands are recorded.
+
+## W. Registry summary — v0.2.5
+
+| Group | Records | PASS | FAIL | NOT VERIFIED |
+|---|---|---|---|---|
+| EXE (local isolation) | 9 | 8 | 0 | 1 |
+| CG (cgroup) | 11 | 10 | 0 | 1 |
+| PT (process tree) | 6 | 5 | 0 | 1 |
+| AGG (aggregate) | 6 | 4 | 0 | 2 |
+| FW (firewall) | 7 | 5 | 2 | 0 |
+| MUT (mutations) | 8 | 8 | 0 | 0 |
+| **v0.2.5 subtotal** | **47** | **40** | **2** | **5** |
+| Historical (v0.2.3 + v0.2.4) | 109 | 94 | 1 | 14 |
+| **Cumulative** | **156** | **134** | **3** | **19** |
+
+### Changes versus the v0.2.4 gate
+
+| Item | v0.2.4 | v0.2.5 |
+|---|---|---|
+| EXEC-01 host network inheritance | **FAIL** (open) | **PASS** (closed) |
+| EXEC-02 restricted provider depth | not recorded | **NOT VERIFIED** (disclosed) |
+| Cgroup enforcement | 18 skipped | **18 passed** |
+| Aggregate limits | unverified | **PASS** |
+| Process-tree containment | partial | **PASS** (0 survivors) |
+| FW-01 authorised upstream | not tested | **FAIL** (newly discovered) |
+| Suite | 360/39 | **405/21** |
+| Second host | NOT VERIFIED | **NOT VERIFIED** |
+| Live connectors | NOT VERIFIED | **NOT VERIFIED** |
+| External review | not performed | **not performed** |
+
+**No historical row was modified. This release adds 47 records and closes one long-standing FAIL.**

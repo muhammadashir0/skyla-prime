@@ -48,13 +48,47 @@ class DisabledProvider(ExecutionProvider):
 
 
 class RestrictedProvider(ExecutionProvider):
-    """Legacy subprocess + rlimits. NOT isolated — dev-only."""
+    """Local subprocess with verified network isolation (EXEC-01, v0.2.5).
+
+    History: this provider used to run the child in the host network namespace
+    and was correctly labelled "NOT isolated". As of v0.2.5 the child runs in a
+    private netns whose isolation is proven before any workload code executes,
+    so the network boundary is now real. It remains weaker than the `namespace`
+    provider — no seccomp, no Landlock, no PID-namespace termination — so it is
+    still not `safe_for_untrusted`, and that distinction is reported rather than
+    blurred.
+    """
     name = "restricted"
-    isolated = False
-    safe_for_untrusted = False
+
+    @property
+    def isolated(self) -> bool:      # type: ignore[override]
+        # True only when isolation is currently verified on this host.
+        from .sandbox import isolation_status
+        return bool(isolation_status().get("verified"))
+
+    @property
+    def safe_for_untrusted(self) -> bool:   # type: ignore[override]
+        # Network confinement does not make this a full security boundary:
+        # no seccomp/Landlock/PID-namespace kill. Refuse to imply otherwise.
+        return False
+
+    def status(self) -> dict:
+        from .sandbox import isolation_status
+        iso = isolation_status()
+        return {"provider": self.name, "isolated": bool(iso.get("verified")),
+                "safe_for_untrusted": False,
+                "network_isolation": iso,
+                "weaker_than": "namespace provider (no seccomp/Landlock/pid-kill)"}
 
     def run(self, code, timeout_s=30, memory_mb=512, network=False) -> dict:
         from .sandbox import run_python
+        if network:
+            # There is no authorised egress path from this provider. Refuse
+            # rather than silently granting host networking to untrusted code.
+            return {"ok": False, "stdout": "", "returncode": -1, "refused": True,
+                    "stderr": "Network-enabled execution is not supported by the "
+                              "local provider (deny by default; no authorised "
+                              "egress gateway path is wired to local execution)."}
         return run_python(code, timeout_s, memory_mb)
 
 

@@ -1,154 +1,156 @@
-# Production Readiness Assessment — v0.2.4
+# Production Readiness Assessment — v0.2.5
 
 **Verdict: NO-GO.**
 
-Not one requirement is weakened to reach a different answer. The release rules name conditions for approval;
-five of them are unmet, and four of those are unmet because an external dependency is unavailable, which is a
-fact about the environment rather than something more code would fix.
+Two release conditions are now met that were not met in v0.2.4 (execution boundary, resource enforcement).
+Three remain unmet, and a new composition defect (FW-01) was found and recorded rather than worked around.
 
-- Assessed commit: `067bdf0` (plus the v0.2.4 documentation in this commit)
-- Previous baseline: v0.2.3 `6b489ef` — 359 passed / 37 skipped
-- This release: **360 passed / 39 skipped**
-- Environment: `e2b.local`, Debian 12, kernel 6.1.158+, 2 vCPU, 3939 MB, cgroup v2 (partial), Landlock ABI 2
+- Assessed commit: v0.2.5
+- Suite: **406 passed / 21 skipped** (delegated) · **385 passed / 42 skipped** (unprivileged)
+- Previous baseline: v0.2.4 — 360 passed / 39 skipped
 
 ---
 
 ## 1. The gate
 
-| # | Release condition | Status | Evidence |
-|---|---|---|---|
-| 1 | No unresolved critical/high findings | **FAIL** | EXEC-01 (`sandbox.py` host network) is open and high |
-| 2 | API network boundary verified | **PASS** | M1: ten confirmations, `COMPLETE_EGRESS_REVIEW.md` |
-| 3 | Execution network boundary verified | **FAIL** | EXEC-01; cgroup binding unverified (18 skips) |
-| 4 | Host-wide firewall deployed where the threat model requires it | **PASS (this host)** | NET-23, `HOST_FIREWALL_DEPLOYMENT.md` |
-| 5 | Second-host validation | **NOT VERIFIED** | HOST-01, no second host |
-| 6 | DB recovery verified | **PASS** | pre-existing DB-01…03, re-run in this suite |
-| 7 | Live connector validation | **NOT VERIFIED** | CONN-01/02/03, no credentials |
-| 8 | Independent external review | **NOT VERIFIED** | not appointed; package prepared |
-| 9 | Complete reproducible evidence with hashes | **PASS** | 109 records, `RELEASE_MANIFEST_v0.2.4.md` |
-| 10 | No requirement weakened to obtain approval | **PASS** | this document |
+| # | Release condition | v0.2.4 | v0.2.5 | Evidence |
+|---|---|---|---|---|
+| 1 | No unresolved critical/high findings | FAIL | **FAIL** | FW-01 (high, availability) |
+| 2 | API network boundary verified | PASS | **PASS** | perimeter `isolated: True` |
+| 3 | Execution network boundary verified | **FAIL** | **PASS** | EXE-01…08, 8 vectors |
+| 4 | Host-wide firewall deployed | PASS (this host) | **PASS** (this host) | firewall `verify` |
+| 5 | Second-host validation | NOT VERIFIED | **NOT VERIFIED** | no second host |
+| 6 | DB recovery verified | PASS | **PASS** | unchanged |
+| 7 | Live connector validation | NOT VERIFIED | **NOT VERIFIED** | no credentials; FW-01 blocks upstream |
+| 8 | Independent external review | NOT VERIFIED | **NOT VERIFIED** | not appointed |
+| 9 | Complete reproducible evidence with hashes | PASS | **PASS** | 156 records, manifest hashes |
+| 10 | No requirement weakened to obtain approval | PASS | **PASS** | this document |
 
 **4 PASS · 2 FAIL · 3 NOT VERIFIED → NO-GO.**
 
-## 2. What genuinely improved since v0.2.3
+## 2. What changed for the better
 
-| Item | v0.2.3 | v0.2.4 |
+| Item | v0.2.4 | v0.2.5 |
 |---|---|---|
-| Host egress firewall | absent (NET-23 FAIL) | **deployed, verified, persistent, reversible** |
-| Outbound mechanism inventory | partial | **exhaustive — no SDKs, no gRPC, no `requests`** |
-| Perimeter proof integrity | **broken** (control always failed; `isolated: True` still printed) | **fixed, fail-closed** |
-| Second-host package | prose | **executable, capability-gated** |
-| Connector safety harness | absent | **present, refuses unsafe runs** |
-| Registry | 81 records | **109 records, append-only proven** |
+| EXEC-01: local sandbox inherited host networking | **open** | **closed** — verified netns isolation |
+| Cgroup enforcement | 18 tests skipped | **18 passed**, limits measured against the kernel |
+| Aggregate protection | unverified | **PASS** — 601 MB of a 1024 MB ceiling |
+| Process-tree containment | partial | **PASS** — 0 survivors after 25 kills |
+| Mutation coverage of execution controls | 0 | **8, all detected** |
+| Suite | 360/39 | **405/21** |
+| Registry | 109 records | **156** |
 
-The most valuable outcome of this milestone is not the firewall. It is the discovery that the v0.2.3 perimeter
-"proof" could not fail: `perimeter.py` used `socket` without importing it, so the host-control probe raised
-`NameError`, and the verdict still printed `isolated: True`. **For an unknown period, a passing proof proved
-nothing.** That is a more serious finding than any individual gap, because it means a prior PASS was worth less
-than it appeared.
+The most significant qualitative change: EXEC-01 was not a missing feature, it was a **false claim**. The
+docstring said "no network" and nothing enforced it. That is now a verified property with a positive control,
+and the provider that has it still refuses to call itself `safe_for_untrusted`.
 
 ## 3. The blocking items
 
-### 3.1 EXEC-01 — `sandbox.py` inherits the host network (FAIL, high)
+### 3.1 FW-01 — the firewall blocks the proxy's own upstream (FAIL, high)
 
-The `local` execution provider runs a child that inherits the host network namespace, so a job executed through
-it is subject to the host firewall but not to the namespace perimeter. It is not the default
-(`SKYLA_EXECUTION_PROVIDER=namespace`), and it was known in v0.2.3.
+The egress proxy runs in the host namespace, so `SKYLA-EGRESS` governs its outbound connections, and no
+exception matches them:
 
-**Why it is still high:** it is a one-variable misconfiguration away from removing a layer of defence, and the
-degradation is silent. Mitigation today is the host firewall; the fix is to route the `local` provider through
-`unshare -n` or to remove it.
+```
+firewall active  → CONNECT api.openai.com:443 → 403 "upstream unreachable"
+firewall rolled back → same CONNECT → 200 Connection Established
+```
 
-**Why it was not fixed in this milestone:** the mission scope was qualification, not implementation change.
-Fixing it here would alter the execution path while the qualification was being measured — and the honest
-sequence is to fix it, then re-qualify.
+**It fails closed.** Nothing leaks; the system refuses to do remote work rather than permitting unaccounted
+egress. But it means the firewall and useful egress are mutually exclusive on this kernel.
+
+The specified fix is one rule — `-m owner --uid-owner <proxy_uid> -j ACCEPT` before the terminal `DROP` —
+which requires `xt_owner`, absent here. The alternative (allow outbound 443 generally) would restore
+availability by destroying the control, and was rejected.
+
+**Consequence:** live connectors cannot be validated on this host with the firewall active. That was already
+NOT VERIFIED for lack of credentials; FW-01 adds a second, independent reason.
 
 ### 3.2 HOST-01 — no second host (NOT VERIFIED)
 
-No hypervisor, container runtime, cloud CLI, `/dev/kvm`, or installable package path. The firewall exceptions
-are correct for `10.201.0.2` and untested anywhere else; cgroup delegation is partial here; Landlock is ABI 2.
-All three are kernel or network properties that only a different machine can settle.
+Unchanged. No hypervisor, runtime, `/dev/kvm` or cloud CLI. `scripts/skyla-host-qualify.sh` is the runnable
+package. **The delegated-cgroup configuration has now only ever been exercised on one kernel** — a second
+host would test whether the delegation procedure generalises, which is the most likely thing to differ.
 
-### 3.3 CONN-01/02/03 — no live connector validation (NOT VERIFIED)
+### 3.3 CONN-01/02/03 — live connectors (NOT VERIFIED)
 
-No credentials exist. Every connector capability is `IMPLEMENTED_NOT_LIVE_TESTED`; **zero are LIVE_VERIFIED**.
-The unit tests prove request shape, not that Google or Telegram accept it, not that a refresh token works, and
-not that a revoked token fails closed.
+Unchanged, no credentials. Zero capabilities are LIVE_VERIFIED.
 
-### 3.4 Independent external review (NOT VERIFIED)
+### 3.4 EXT-01 — independent external review (NOT VERIFIED)
 
-Not appointed. The internal reviews in this repository say so explicitly and do not claim otherwise.
+Not appointed. `EXTERNAL_REVIEW_PACKAGE.md` (v0.2.4) is the handover; §8 of that document lists the seven
+things a reviewer should be most suspicious of.
 
-## 4. Regression analysis versus baseline
+## 4. Secondary gaps, recorded not hidden
 
-| Comparison | v0.2.3 | v0.2.4 | Assessment |
+| ID | Item | Why it matters |
+|---|---|---|
+| EXEC-02 | Restricted provider has no seccomp/Landlock/PID-kill | network-confined only; `safe_for_untrusted: False` |
+| CG-06 | No disk/IO quota | a workload can fill the shared filesystem apart from `RLIMIT_FSIZE` |
+| PT-06 | API restart during execution unexercised | the design keeps workloads independent; unproven |
+| AGG-05/06 | Large-output and disk-exhaustion tests not run | testing an unconfigured control was judged not worth the risk to the environment |
+
+## 5. Regression analysis
+
+| Comparison | v0.2.4 | v0.2.5 | Assessment |
 |---|---|---|---|
-| Passed | 359 | 360 | +1 (new `test_a_failed_host_control_means_isolation_is_not_proven`) |
-| Skipped | 37 | 39 | +2, both explained below |
+| Passed (unprivileged) | 360 | 384 | +24 (20 isolation + 4 other) |
+| Skipped (unprivileged) | 39 | 42 | +3 cgroup mutations needing placement |
+| Passed (delegated) | — | 405 | cgroup tests execute |
 | Failures | 0 | 0 | none |
 
-The two additional skips are **not** silent regressions:
+No test was deleted, weakened, or made unconditionally skipped. The two v0.2.4 skips caused by the firewall
+denying real internet access remain, correctly guarded with a stated reason.
 
-1. `test_egress.py:225` — "host cannot reach pypi.org (egress allowlist or host firewall)". This test makes a
-   real internet connection; the newly deployed default-deny firewall makes it impossible. Guarded with a
-   stated reason.
-2. `test_egress.py:246` — same cause, sandbox allowlist.
-
-Neither was silenced by deleting an assertion. The guard is the file's pre-existing `_egress_allowed_for()`
-helper, which reports *why* it cannot run — a skip with a cause, not a disabled test.
-
-**No test was weakened, deleted, or made unconditionally skipped to obtain a green run.**
-
-## 5. Security posture summary
+## 6. Security posture
 
 | Boundary | Enforcement | Verified | Residual risk |
 |---|---|---|---|
-| Untrusted job → network | netns + seccomp | kernel-level, manual + root tests | cgroup limits unproven (18 skips) |
-| API → internet | namespace + proxy + capability policies | live sweep, both layers | none found |
-| Host → internet | iptables default-deny | `verify` PASS, reboot-tested | **no denial logging** (NET-31) |
-| `local` provider → network | **host firewall only** | — | **EXEC-01, high** |
-| Provider auth | env-only, never in payload | grep + payload inspection | connectors unvalidated live |
-| Data durability | SQLite + recovery | pre-existing, re-run | none found |
+| Untrusted job → network | `unshare -n` + verified proof | **yes**, 8 vectors | none found |
+| Untrusted job → host loopback | namespace | **yes** | none found |
+| Untrusted job → resources | cgroup v2 per-job + aggregate | **yes**, kernel-measured | no disk quota |
+| Job tree → survivors | PID namespace + `cgroup.kill` | **yes**, 0 survivors | API restart case unproven |
+| API → internet | namespace + proxy + capability | **yes** | none found |
+| Host → internet | iptables default-deny | **yes** | **FW-01: proxy upstream blocked** |
+| Restricted provider depth | no seccomp/Landlock | disclosed | EXEC-02 |
+| Provider auth | env-only, never in payload | yes | connectors unvalidated live |
 
-## 6. What would change this verdict
-
-Ordered by cost, cheapest first:
+## 7. What would change this verdict
 
 | # | Action | Effort | Unblocks |
 |---|---|---|---|
-| 1 | Fix EXEC-01: `unshare -n` in the `local` provider, then re-run | hours | gate 1, 3 |
-| 2 | Bootstrap the cgroup subtree; re-run to convert 18 skips into results | hours | gate 3 |
-| 3 | Obtain test credentials; run `scripts/connector_validation.py` | days (external) | gate 7 |
-| 4 | Obtain a second host; run `scripts/skyla-host-qualify.sh run` | external | gate 5 |
-| 5 | Appoint an independent reviewer; hand them `EXTERNAL_REVIEW_PACKAGE.md` | external | gate 8 |
+| 1 | Deploy on a host with `xt_owner`; add the one owner rule | hours (external host) | gate 1, partially 7 |
+| 2 | Obtain test credentials; run `scripts/connector_validation.py` | days (external) | gate 7 |
+| 3 | Obtain a second host; run `scripts/skyla-host-qualify.sh run` | external | gate 5 |
+| 4 | Appoint an independent reviewer | external | gate 8 |
+| 5 | Configure `io.max` and test disk bounds | hours | CG-06 |
 
-Four of the five are external dependencies. Only items 1 and 2 are work this repository can do alone — and
-doing them would strengthen the assessment without being sufficient for approval.
+All five are external or configuration work. None is "write more features", which is the correct shape for a
+release whose remaining gaps are environmental.
 
-## 7. Integrity statement
+## 8. Integrity statement
 
-- The full suite ran unprivileged: **360 passed / 39 skipped**. Root runs are limited to namespace entry and
-  firewall management, because the supervisor correctly refuses to execute untrusted jobs as root.
-- Every skip is explained with its production significance (§N of the registry). No skip counts as a pass.
-- Historical evidence was **not** rewritten. The registry grew by append only: 131 insertions, **0 deletions**,
-  and the prefix is byte-identical to `git show 6b489ef:SECURITY_EVIDENCE_REGISTRY.md`.
-- No force-push was used. No commit was amended or rewritten.
+- The full suite ran unprivileged: **385 passed / 42 skipped**. Root is used for exactly one operation —
+  placing a process into the delegated cgroup — after which the workload runs as the service user, because
+  the supervisor refuses to execute untrusted jobs as root.
+- Every skip is explained with its production significance. **No skip counts as a pass.**
+- Historical evidence was not rewritten: the registry grew by **164 insertions and 0 deletions**, verified
+  with `git diff --numstat`.
+- No force-push, no amended commits, no rewritten audit output.
 - No live connector result was fabricated. No external test was simulated.
-- Mock operations remain labelled `MOCK_ONLY`; connectors report `mode=mock` from their own code.
-- One placeholder hash was written into the registry appendix during authoring and corrected to the real
-  computed value before commit — noted here because a fabricated hash in an evidence registry is the exact
-  failure this document exists to prevent.
+- Host firewall rules were not modified; the backup and rollback path was exercised and verified.
+- Two of my own measurement mistakes (a positive control placed where it could never pass; a latency probe
+  against a 404) are recorded in `EXECUTION_SECURITY_EVIDENCE.md` §5 rather than quietly corrected.
 
-## 8. Verdict
+## 9. Verdict
 
 **NO-GO for production.**
 
-Two FAILs (EXEC-01; the execution boundary that inherits on, and cgroup limits that are unproven) and three
-NOT VERIFIEDs (second host, live connectors, external review). None can be closed by re-running the suite, and
-three cannot be closed from inside this environment at all.
+Closed: the execution boundary. The local sandbox can no longer reach the network, the kernel enforces the
+resource limits that were previously aspirational, and no workload process outlives its task. Those were the
+two P0 items and they are done, with 8 mutations proving the tests can detect their removal.
 
-What is defensible today: the API's network boundary is genuinely confined and was re-verified against a fresh,
-exhaustive inventory; the host now denies egress by default and survives reboot; the verification machinery
-itself is stronger, because it was found to be lying and was fixed.
+Open: FW-01, second host, live connectors, external review. The first is a kernel limitation with a specified
+fix; the other three are external dependencies that more code cannot close.
 
-That is meaningful progress and it is not approval. The requirement was not weakened to say otherwise.
+Production approval was not obtained, and no requirement was weakened to imply otherwise.
