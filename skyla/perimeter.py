@@ -308,13 +308,32 @@ class EgressPerimeter:
 
         Returns status with `available` False if any probe reaches the network. A
         perimeter that has not been probed is not a perimeter.
+
+        Works on an EXISTING namespace, not only one this object built: an operator
+        verifying a deployed perimeter gets a fresh `EgressPerimeter` with no
+        `_created` flag, and the earlier version refused there with "namespace was
+        not created" — a false negative in the one command used to check health.
+        Presence on disk is the condition that matters.
         """
-        if not self._created:
+        installed = Path(f"/var/run/netns/{self.name}").exists()
+        installed = installed and Path(f"/var/run/netns/{self.gateway_name}").exists()
+        if not installed:
             self.status.available = False
-            self.status.reason = self.status.reason or "namespace was not created"
+            self.status.reason = (
+                f"namespaces {self.name!r}/{self.gateway_name!r} are not present — "
+                f"run scripts/skyla-perimeter.sh setup")
             return self.status
+        self._created = True
 
         r = _run(["ip", "netns", "exec", self.name, "ip", "-j", "addr"], check=False)
+        # An unprivileged caller cannot enter the namespace at all. That is not a
+        # perimeter failure, but it must not be reported as success either.
+        if r.returncode != 0 or "not permitted" in (r.stderr or "").lower():
+            self.status.available = False
+            self.status.reason = (
+                f"cannot enter namespace {self.name!r}: "
+                f"{(r.stderr or '').strip()[:120]} (verification needs CAP_SYS_ADMIN)")
+            return self.status
         ifaces: list[str] = []
         try:
             for link in json.loads(r.stdout or "[]"):
@@ -341,18 +360,24 @@ class EgressPerimeter:
         self.status.has_default_route = has_default
         self.status.verified_at = time.time()
 
+        problems = []
+        if not ifaces:
+            problems.append(f"namespace {self.name!r} reports no interfaces")
         if has_default:
-            self.status.available = False
-            self.status.reason = (
-                "the workload namespace has a default route — traffic could escape")
+            problems.append("the workload namespace has a default route — "
+                            "traffic could escape")
         if ipv6_present:
-            self.status.available = False
-            self.status.reason = "the workload namespace has IPv6 routes — v6 path exists"
+            problems.append("the workload namespace has IPv6 routes — the v6 path exists")
         if not gw_ready:
-            self.status.available = False
-            self.status.reason = (
-                f"the gateway namespace {self.gateway_name!r} is missing or has no "
-                f"routes — the proxy could not reach upstream")
+            problems.append(f"the gateway namespace {self.gateway_name!r} is missing "
+                            f"or has no routes — the proxy could not reach upstream")
+
+        # Only now is `available` decided. Leaving it at the dataclass default made
+        # a healthy perimeter report `available: False` with an empty reason, which
+        # is its own kind of false signal: the operator cannot tell "broken" from
+        # "not measured".
+        self.status.available = not problems
+        self.status.reason = "; ".join(problems)
         if self.proxy_port:
             self.status.proxy_endpoint = f"http://{self.host_ip}:{self.proxy_port}"
         return self.status
@@ -404,20 +429,26 @@ class EgressPerimeter:
         host_result = {}
         for name, (host, port) in targets.items():
             try:
-                import socket
                 s = socket.create_connection((host, port), timeout=3)
                 s.close()
                 host_result[name] = "REACHED"
             except Exception as exc:                        # noqa: BLE001
                 host_result[name] = type(exc).__name__
 
+        # A probe that never ran is NOT isolation. The first version computed
+        # `leaked` from an empty/error dict, so an unprivileged caller that could
+        # not enter the namespace was told "isolated: True". Fail closed instead:
+        # measured means measured, otherwise report the failure and say so.
+        measured = not (len(ns_result) == 1 and "error" in ns_result)
         leaked = [k for k, v in ns_result.items() if v == "REACHED"]
         return {
             "namespace": self.name,
             "inside": ns_result,
             "host_control": host_result,
             "leaked": leaked,
-            "isolated": not leaked,
+            "isolated": bool(measured and not leaked and ns_result),
+            "measured": measured,
+            "reason": "" if measured else f"probe did not run: {ns_result.get('error', '')}"[:200],
             "host_has_network": any(v == "REACHED" for v in host_result.values()),
         }
 

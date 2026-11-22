@@ -302,3 +302,77 @@ def test_run_confined_requires_both_namespaces():
         pytest.skip("perimeter is installed; the absent-namespace path cannot be exercised")
     with pytest.raises(PerimeterUnavailable):
         run_confined("print('should not run')")
+
+
+# ------------------------------------------- status reporting cannot lie upward
+def test_an_unmeasured_probe_never_reports_isolated(monkeypatch):
+    """A probe that could not run must not be read as 'isolated'.
+
+    Measured defect: `prove_no_egress` computed `leaked` from an error dict and
+    returned `isolated: True` for an unprivileged caller who could not enter the
+    namespace at all. That is the exact false-assurance pattern this programme
+    exists to remove, in the reporting layer rather than the enforcement layer.
+    """
+    p = EgressPerimeter("whatever")
+    monkeypatch.setattr(p, "run_probe",
+                        lambda *a, **k: {"returncode": 1, "stdout": "",
+                                         "stderr": "setting the network namespace failed: "
+                                                   "Operation not permitted"})
+    proof = p.prove_no_egress()
+    assert proof["measured"] is False, "an empty probe was treated as a measurement"
+    assert proof["isolated"] is False, "an unrun probe was reported as isolated"
+    assert proof["reason"], "no reason given for an unmeasured probe"
+
+
+def test_verify_reports_available_true_for_a_healthy_namespace(monkeypatch):
+    """Regression: `available` was never set, so a healthy perimeter said False.
+
+    An operator cannot distinguish "broken" from "not measured" if success also
+    reads as failure.
+    """
+    p = EgressPerimeter("whatever")
+
+    class R:
+        def __init__(self, out="", rc=0, err=""):
+            self.stdout, self.returncode, self.stderr = out, rc, err
+
+    def fake_run(cmd, *a, **k):
+        joined = " ".join(cmd)
+        if "-j" in joined and "addr" in joined:
+            return R('[{"ifname":"lo"},{"ifname":"sk999dwp"}]')
+        if "-6" in joined:
+            return R("")
+        if "route" in joined and "exec" in joined:
+            return R("10.200.0.1 dev skw scope link")
+        return R("")
+
+    monkeypatch.setattr("skyla.perimeter._run", fake_run)
+    monkeypatch.setattr("skyla.perimeter.Path.exists", lambda self: True)
+    st = p.verify()
+    assert st.available is True, f"healthy perimeter reported unavailable: {st.reason}"
+    assert st.reason == ""
+
+
+def test_verify_reports_available_false_with_a_reason_when_broken(monkeypatch):
+    """And the failure case must explain itself rather than report an empty reason."""
+    p = EgressPerimeter("whatever")
+
+    class R:
+        def __init__(self, out="", rc=0, err=""):
+            self.stdout, self.returncode, self.stderr = out, rc, err
+
+    def fake_run(cmd, *a, **k):
+        joined = " ".join(cmd)
+        if "-j" in joined and "addr" in joined:
+            return R('[{"ifname":"lo"},{"ifname":"sk999dwp"}]')
+        if "-6" in joined:
+            return R("")
+        if "route" in joined and "exec" in joined:
+            return R("default via 10.200.0.1 dev s kw")   # a default route exists
+        return R("")
+
+    monkeypatch.setattr("skyla.perimeter._run", fake_run)
+    monkeypatch.setattr("skyla.perimeter.Path.exists", lambda self: True)
+    st = p.verify()
+    assert st.available is False
+    assert "default route" in st.reason, f"unhelpful reason: {st.reason!r}"
