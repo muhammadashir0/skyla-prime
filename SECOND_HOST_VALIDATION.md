@@ -102,12 +102,13 @@ Database files are created `0600` inside a `0700` directory by
 |---|---|---|
 | `tests/security/test_host_containment.py` | 20 | **PASS** (live kernel) |
 | `tests/security/test_mutation_harness.py` | 13 | **PASS** (13/13 mutations detected) |
-| `tests/security/test_cgroups.py` | 16 | **PASS** when run inside the delegated subtree |
+| `tests/security/test_cgroups.py` | 18 | **PASS** when run inside the delegated subtree (stable over 10 consecutive runs) |
+| `tests/security/test_cgroup_failclosed.py` | 15 | **PASS** anywhere (no kernel privileges needed) |
 | `tests/security/test_egress.py` | 22 | **PASS** |
 | `tests/security/test_backup.py` | 13 | **PASS** |
 | `tests/security/test_multiworker.py` | 9 | **PASS** |
 | `tests/security/test_connector_reliability.py` | 16 | **PASS** |
-| Full suite | 304 passed, 16 skipped | **PASS** |
+| Full suite | 307 passed, 16 skipped | **PASS** |
 
 The 16 skips are the cgroup tests when invoked outside the delegated subtree. A
 skip is recorded as `NOT VERIFIED`, never as a pass — that distinction is load

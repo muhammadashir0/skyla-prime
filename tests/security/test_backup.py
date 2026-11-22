@@ -4,6 +4,7 @@ Every test asserts on recovered DATA, not on the backup function's return value.
 The A-14 defect is reproduced first, so the tests are demonstrably sensitive to it.
 """
 import os
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -121,6 +122,83 @@ def test_backup_during_concurrent_writes_is_consistent(live):
     finally:
         con.close()
     assert rows >= 1, "concurrent backup captured no data at all"
+
+
+def test_backup_never_captures_a_torn_transaction(live):
+    """A snapshot must not contain half of a committed transaction.
+
+    Each transaction writes TWO marker rows (detail ends 'a' and 'b'). Any
+    correct snapshot therefore holds equally many 'a' and 'b' markers: a
+    transaction is present entirely or not at all. An imbalance means a partial
+    transaction was captured.
+
+    This is deterministic, not timing-dependent: the markers are compared inside
+    one snapshot, so no clock or scheduler coincidence can hide a tear.
+
+    Sensitivity is demonstrated by mutation (documented in
+    WAL_BACKUP_RECOVERY_REPORT.md §2): replacing the online backup API with a
+    copy of the main DB file makes this test fail, because the WAL-resident
+    markers are then absent entirely.
+    """
+    db, path = live
+    stop = threading.Event()
+
+    def writer(tag):
+        # Own connection, explicit transactions: two statements, one commit.
+        con = sqlite3.connect(path, timeout=30)
+        try:
+            for i in range(150):
+                if stop.is_set():
+                    return
+                con.execute("BEGIN IMMEDIATE")
+                con.execute("INSERT INTO audit_log (ts,actor,action,detail)"
+                            " VALUES (?,?,?,?)", (time.time(), tag, "pair", f"{i}a"))
+                con.execute("INSERT INTO audit_log (ts,actor,action,detail)"
+                            " VALUES (?,?,?,?)", (time.time(), tag, "pair", f"{i}b"))
+                con.commit()
+        finally:
+            con.close()
+
+    threads = [threading.Thread(target=writer, args=(f"t{i}",)) for i in range(3)]
+    for t in threads:
+        t.start()
+
+    recs = []
+    mgr = BackupManager(path)
+    for _ in range(5):
+        time.sleep(0.02)
+        recs.append(mgr.backup(label="torn"))
+    stop.set()
+    for t in threads:
+        t.join(timeout=60)
+
+    for rec in recs:
+        con = sqlite3.connect(f"file:{rec.path}?mode=ro", uri=True)
+        try:
+            assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            halves = con.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE action='pair'"
+                "   AND (detail LIKE '%a' OR detail LIKE '%b')").fetchone()[0]
+            a = con.execute("SELECT COUNT(*) FROM audit_log WHERE action='pair'"
+                            "   AND detail LIKE '%a'").fetchone()[0]
+            b = con.execute("SELECT COUNT(*) FROM audit_log WHERE action='pair'"
+                            "   AND detail LIKE '%b'").fetchone()[0]
+        finally:
+            con.close()
+        assert a == b, (
+            f"snapshot {rec.path} holds {a} 'a' and {b} 'b' markers "
+            f"({halves} total) — unequal marker counts mean a half-committed "
+            "transaction was captured (torn snapshot)")
+
+    # The snapshots must also have captured something: an all-empty backup is
+    # balanced but useless, and would pass the check above vacuously.
+    con = sqlite3.connect(f"file:{recs[-1].path}?mode=ro", uri=True)
+    try:
+        total = con.execute("SELECT COUNT(*) FROM audit_log WHERE action='pair'"
+                            ).fetchone()[0]
+    finally:
+        con.close()
+    assert total > 0, "no committed marker rows reached any snapshot"
 
 
 def test_backup_is_checksummed_and_manifested(live):
@@ -269,3 +347,103 @@ def test_backup_of_a_database_with_an_interrupted_wal_is_valid(live):
     con.close()
     assert rec.tables["audit_log"] >= 50
     assert rec.integrity == "ok"
+
+
+def test_torn_db_wal_pair_loses_rows_silently_but_online_backup_does_not(live):
+    """A -wal copied at a DIFFERENT instant from its -db is silently wrong.
+
+    This is the second half of A-14 and it is worse than the empty-copy case,
+    because nothing reports an error: `integrity_check` says `ok` and the file
+    opens normally, it simply holds fewer committed rows than the source.
+
+    Deterministic: the checkpoint below is explicit, so the row counts are fixed.
+    """
+    db, path = live
+
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    con.execute("CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v TEXT)")
+    for i in range(4):                       # transaction 1
+        con.execute("INSERT INTO t(v) VALUES(?)", (f"a{i}",))
+    con.commit()
+
+    stale_wal = os.path.join(tempfile.mkdtemp(), "stale.wal")
+    shutil.copyfile(path + "-wal", stale_wal)   # snapshot of the WAL, now stale
+
+    for i in range(2):                       # transaction 2
+        con.execute("INSERT INTO t(v) VALUES(?)", (f"b{i}",))
+    con.commit()
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # all 6 rows now in the main file
+    committed = con.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+    assert committed == 6
+    con.close()
+
+    # The naive method: main file from AFTER the checkpoint, WAL from BEFORE it.
+    torn = os.path.join(tempfile.mkdtemp(), "torn.db")
+    shutil.copyfile(path, torn)
+    shutil.copyfile(stale_wal, torn + "-wal")
+    con = sqlite3.connect(torn)
+    try:
+        torn_integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
+        torn_rows = con.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+    except sqlite3.DatabaseError as exc:      # also an acceptable outcome
+        torn_integrity, torn_rows = f"error: {exc}", 0
+    finally:
+        con.close()
+
+    assert torn_integrity == "ok", "if SQLite detects the tear, that is even better"
+    assert torn_rows < committed, (
+        f"expected the torn pair to lose rows silently, got {torn_rows}/{committed}")
+
+    # The online backup of the same live database loses nothing.
+    rec = BackupManager(path).backup(label="torn-control")
+    con = sqlite3.connect(f"file:{rec.path}?mode=ro", uri=True)
+    try:
+        backs = con.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        con.close()
+    assert backs == committed, f"online backup lost rows: {backs}/{committed}"
+
+
+def test_online_backup_captures_uncheckpointed_wal_only_with_the_api(live):
+    """Contrast, in one place: same WAL state, two methods, different answers.
+
+    Main file alone -> schema/data missing. Online backup API -> complete.
+    This is the A-14 defect and its fix, side by side, from the same source.
+    """
+    db, path = live
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    con.execute("CREATE TABLE IF NOT EXISTS walonly(id INTEGER PRIMARY KEY, v TEXT)")
+    for i in range(25):
+        con.execute("INSERT INTO walonly(v) VALUES(?)", (f"r{i}",))
+    con.commit()
+    payload = con.execute("SELECT COUNT(*) FROM walonly").fetchone()[0]
+    assert payload == 25
+    assert os.path.getsize(path + "-wal") > 0, "precondition: rows are still in the WAL"
+    # leave the connection open: the data is genuinely only in the WAL
+
+    main_only = os.path.join(tempfile.mkdtemp(), "mainonly.db")
+    shutil.copyfile(path, main_only)
+    con2 = sqlite3.connect(main_only)
+    try:
+        try:
+            main_rows = con2.execute("SELECT COUNT(*) FROM walonly").fetchone()[0]
+        except sqlite3.DatabaseError:
+            main_rows = 0
+    finally:
+        con2.close()
+
+    rec = BackupManager(path).backup(label="walonly")
+    con3 = sqlite3.connect(f"file:{rec.path}?mode=ro", uri=True)
+    try:
+        backed_rows = con3.execute("SELECT COUNT(*) FROM walonly").fetchone()[0]
+    finally:
+        con3.close()
+    con.close()
+
+    assert main_rows == 0, f"main-file copy unexpectedly kept {main_rows} rows"
+    assert backed_rows == payload, f"online backup kept {backed_rows}/{payload}"

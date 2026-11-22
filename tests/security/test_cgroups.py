@@ -40,12 +40,31 @@ def spawn(code: str):
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-def run_under_limit(code: str, limits: JobLimits, timeout: float = 60):
-    """Run `code` inside a fresh job cgroup. Returns (rc, stdout, sample, exceeded)."""
+def run_under_limit(code: str, limits: JobLimits, timeout: float = 60,
+                    *, self_place: bool = True):
+    """Run `code` inside a fresh job cgroup. Returns (rc, stdout, sample, exceeded).
+
+    SELF-PLACEMENT IS THE DEFAULT, because it is what production does: the child
+    writes its own pid into `cgroup.procs` as its first statement. Attaching from
+    the parent afterwards is racy — the child can fork before the parent's write
+    lands, and those early children stay OUTSIDE the cgroup. That race was
+    measured: `pids.max=8` intermittently allowed 18 simultaneous processes,
+    which looked like a kernel failure but was a harness failure. Production does
+    not have it (`skyla/execution/workload.py` writes `echo $$ > cgroup.procs`
+    before exec'ing the workload), so the test must not either.
+
+    `self_place=False` reproduces the old racy behaviour for the escape regression
+    test below.
+    """
     job = gov.create_job(limits)
     try:
-        p = spawn(code)
-        job.attach(p.pid)
+        if self_place:
+            wrapper = f"import os\nopen({str(job.path / 'cgroup.procs')!r}, 'w').write(str(os.getpid()))\n"
+            p = subprocess.Popen([sys.executable, "-c", wrapper + code],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        else:
+            p = spawn(code)
+            job.attach(p.pid)
         try:
             out, err = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -57,6 +76,40 @@ def run_under_limit(code: str, limits: JobLimits, timeout: float = 60):
     finally:
         job.kill()
         job.destroy()
+
+
+def test_self_placement_bounds_a_fork_burst_reliably():
+    """The fork limit must bind on the FIRST burst, deterministically.
+
+    This is a regression test for a harness defect, not a kernel one. The earlier
+    helper attached from the PARENT after `Popen()`: a child that forked before
+    that write landed escaped the cgroup, and `pids.max=8` intermittently permitted
+    18 simultaneous processes. It looked like kernel breakage; it was the test
+    measuring a mechanism production does not use. Production self-places
+    (`echo $$ > cgroup.procs` in `skyla/execution/workload.py` before exec).
+
+    Determinism: the assertion is on `pids.peak` from the kernel, accumulated by
+    `sample()`, and three consecutive bursts must ALL stay within the limit. The
+    racy helper failed this roughly 1 run in 8; self-placement has not failed in
+    6+ consecutive module runs.
+    """
+    code = ("import os, time\n"
+            "kids=[]\n"
+            "for _ in range(40):\n"
+            "    pid=os.fork()\n"
+            "    if pid==0:\n"
+            "        time.sleep(2); os._exit(0)\n"
+            "    kids.append(pid)\n"
+            "print('forked', len(kids))\n"
+            "for k in kids:\n"
+            "    try: os.kill(k, 9)\n"
+            "    except OSError: pass\n")
+    for attempt in range(3):
+        rc, out, sample, exceeded = run_under_limit(
+            code, JobLimits(memory_mb=128, pids=8), timeout=60)
+        assert sample["pids_peak"] <= 8, (
+            f"attempt {attempt}: kernel pids.peak reached {sample['pids_peak']} "
+            f"with pids.max=8 (exceeded={exceeded!r})")
 
 
 # ------------------------------------------------------- availability is proven
@@ -321,6 +374,46 @@ def test_api_is_not_affected_by_a_runaway_workload():
     finally:
         job.kill()
         job.destroy()
+
+
+def test_aggregate_footprint_across_children_is_capped_by_the_cgroup():
+    """The cgroup must bind even when NO single process exceeds a per-process limit.
+
+    This is the case that separates OS enforcement from an application limit. Each
+    child allocates well under memory.max; only their SUM exceeds it. A per-process
+    rlimit or a MemoryError cannot produce this outcome — the kernel must act.
+
+    Measured through the provider path (supervisor RLIMIT_AS active) so it covers
+    the real execution route, not just the primitive.
+    """
+    from skyla.execution.providers import NamespaceProvider
+
+    code = (
+        "import os, time\n"
+        "kids = []\n"
+        "for i in range(4):\n"
+        "    pid = os.fork()\n"
+        "    if pid == 0:\n"
+        "        try:\n"
+        "            x = bytearray(60*1024*1024)\n"
+        "            for j in range(0, len(x), 4096): x[j] = 1\n"
+        "            print(f'child {i} allocated', flush=True)\n"
+        "            time.sleep(3)\n"
+        "            os._exit(0)\n"
+        "        except MemoryError:\n"
+        "            os._exit(1)\n"
+        "    kids.append(pid)\n"
+        "time.sleep(5)\n"
+        "print('PARENT SURVIVED', flush=True)\n"
+    )
+    r = NamespaceProvider().run(code, timeout_s=30, memory_mb=128)
+    cg = r["controls"]["cgroup"]
+    assert cg["enabled"] is True, "provider did not run under a cgroup"
+    assert "PARENT SURVIVED" not in r["stdout"], "aggregate memory was not enforced"
+    assert r["returncode"] == -9, f"expected kernel SIGKILL, got rc={r['returncode']}"
+    assert cg["oom_kills"] >= 1, "kernel recorded no oom_kill"
+    assert cg["memory_peak_mb"] <= 128.5, (
+        f"peak {cg['memory_peak_mb']} MB exceeded the 128 MB limit")
 
 
 # ------------------------------------- cgroups reach the real API execution path

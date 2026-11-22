@@ -271,13 +271,25 @@ class CgroupGovernor:
         # itself has memory.*/pids.*/cpu.* files, and on the AGGREGATE so its
         # child job cgroups inherit those controllers. Enabling both is required:
         # a controller enabled only at the root does not reach grandchildren.
-        _write(self.root / "cgroup.subtree_control", "+memory +pids +cpu")
-        _write(agg / "cgroup.subtree_control", "+memory +pids +cpu")
-        _write(agg / "memory.max", str(self.agg_memory_mb * MIB))
-        _write(agg / "memory.swap.max", "0")     # no swapping around the limit
-        _write(agg / "pids.max", str(self.agg_pids))
-        _write(agg / "cpu.max",
-               f"{self.agg_cpu_quota_us} 100000")
+        #
+        # Every write here is load-bearing: an aggregate ceiling that silently
+        # failed to apply would leave the global limit absent while status()
+        # reported a configured value (measured — all three files ABSENT with no
+        # exception). Fail closed instead.
+        for target, value, label in (
+            (self.root / "cgroup.subtree_control", "+memory +pids +cpu",
+             "controllers on the delegation root"),
+            (agg / "cgroup.subtree_control", "+memory +pids +cpu",
+             "controllers on the aggregate"),
+            (agg / "memory.max", str(self.agg_memory_mb * MIB), "aggregate memory.max"),
+            (agg / "memory.swap.max", "0", "aggregate memory.swap.max"),
+            (agg / "pids.max", str(self.agg_pids), "aggregate pids.max"),
+            (agg / "cpu.max", f"{self.agg_cpu_quota_us} 100000", "aggregate cpu.max"),
+        ):
+            if not _write(target, value):
+                raise CgroupUnavailable(
+                    f"cannot set {label} ({target}) — refusing to run workloads "
+                    f"under an unenforced aggregate ceiling")
         return agg
 
     def usage(self) -> AggregateUsage:
@@ -324,12 +336,27 @@ class CgroupGovernor:
             path.mkdir(exist_ok=False)
             self._jobs[jid] = path
 
-        _write(path / "memory.max", str(limits.memory_mb * MIB))
-        _write(path / "memory.swap.max", "0")
-        # Kill the WHOLE group on OOM rather than one unlucky process.
-        _write(path / "memory.oom.group", "1")
-        _write(path / "pids.max", str(limits.pids))
-        _write(path / "cpu.max", limits.cpu_max())
+        # Every limit write is load-bearing. Failing to write one used to leave a
+        # job cgroup that enforced NOTHING while the caller reported
+        # `enabled: true` to the API (measured: memory.max/pids.max/cpu.max all
+        # absent, zero jobs rejected). Fail closed: refusing the workload is
+        # correct, silently running it unbounded is not.
+        for filename, value in (
+            ("memory.max", str(limits.memory_mb * MIB)),
+            ("memory.swap.max", "0"),        # no swapping around the limit
+            ("memory.oom.group", "1"),       # kill the WHOLE group on OOM
+            ("pids.max", str(limits.pids)),
+            ("cpu.max", limits.cpu_max()),
+        ):
+            if not _write(path / filename, value):
+                self._forget(jid)
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+                raise CgroupUnavailable(
+                    f"cannot set {filename} on {path} — refusing to run the "
+                    f"workload with an unenforced limit")
         return JobCgroup(jid, path, limits, self)
 
     def _forget(self, job_id: str) -> None:

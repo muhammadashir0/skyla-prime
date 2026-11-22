@@ -95,7 +95,7 @@ Required deployment shape: **start the service inside the delegated subtree**
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -q -rs           # expect 304 passed, 16 skipped
+python -m pytest tests/ -q -rs           # expect 322 passed, 18 skipped
 ```
 
 Per-area counts (security-relevant):
@@ -105,8 +105,9 @@ Per-area counts (security-relevant):
 | Host containment (caps/seccomp/Landlock/rlimits) | `tests/security/test_host_containment.py` | 20 |
 | Egress proxy | `tests/security/test_egress.py` | 22 (2 hit the live network; skip if blocked) |
 | Database integrity | `tests/security/test_db_integrity.py` | 17 |
-| cgroups | `tests/security/test_cgroups.py` | 16 (all skip outside the delegated subtree) |
-| Backup/restore | `tests/security/test_backup.py` | 13 |
+| cgroups | `tests/security/test_cgroups.py` | 18 (all skip outside the delegated subtree) |
+| cgroup fail-closed | `tests/security/test_cgroup_failclosed.py` | 15 (runs anywhere) |
+| Backup/restore | `tests/security/test_backup.py` | 16 |
 | Connector mock/live separation | `tests/security/test_connector_reliability.py` | 16 |
 | MFA / throttling | `tests/security/test_auth_mfa.py` | 12 |
 | SSRF | `tests/security/test_ssrf.py` | 45 |
@@ -115,7 +116,7 @@ Per-area counts (security-relevant):
 | Multi-worker idempotency | `tests/security/test_multiworker.py` | 9 |
 | Mutation harness | `tests/security/test_mutation_harness.py` | 13 |
 
-Security suite total 219, unit suite 101, **320 collected** (304 run + 16 skipped).
+Security suite total 239, unit suite 101, **340 collected** (322 run + 18 skipped).
 
 ## 5. Adversarial cases the implementer did **not** cover
 
@@ -230,6 +231,10 @@ Plus newly identified in this release (not in the v0.2.1 numbering):
 | B-05 | Medium | External `SIGKILL` of a worker is not recovered | same §4 |
 | B-06 | Medium | API-side fetchers keep a DNS-rebinding window | `EGRESS_PROXY_ASSESSMENT.md` §6 |
 | B-07 | Medium | No scheduled backup; no off-site copy | `WAL_BACKUP_RECOVERY_REPORT.md` §5 |
+| B-08 | High | **CLOSED in this release** — cgroup governor failed open: limit writes were unchecked, so a job with no `memory.max`/`pids.max`/`cpu.max` was returned and reported as `enabled: true` | `CGROUPS_VALIDATION.md` §6.0; verify with `tests/security/test_cgroup_failclosed.py` |
+
+B-08 is listed so the reviewer can verify the *fix*, not because it is open. Re-run
+it against `git show 0356454:skyla/execution/cgroups.py` to see the failure.
 
 ## 9. Questions the reviewer must answer
 
@@ -255,7 +260,7 @@ Plus newly identified in this release (not in the v0.2.1 numbering):
 | 1 | Host isolation independently verified | **NOT VERIFIED** | single host only — `SECOND_HOST_VALIDATION.md` |
 | 2 | Per-job + aggregate resource protection | **PASS** | `CGROUPS_VALIDATION.md` |
 | 3 | Process-tree cleanup reliable | **PASS** | `CGROUPS_VALIDATION.md` §5 (cgroup.kill + pid namespace) |
-| 4 | Egress demonstrably controlled | **PARTIAL** | `EGRESS_PROXY_ASSESSMENT.md` — proxy yes, perimeter no (B-01) |
+| 4 | Egress demonstrably controlled | **FAIL** as a perimeter / **PASS** as a proxy | `EGRESS_PROXY_ASSESSMENT.md` — proxy controls verified; no firewall, so B-01 open |
 | 5 | Cross-user boundaries intact | **PASS** | v0.3.0 A-05 parity suite |
 | 6 | DB integrity + backup restoration | **PASS** | `WAL_BACKUP_RECOVERY_REPORT.md` |
 | 7 | Multi-worker idempotency proven | **PASS** | `MULTI_WORKER_CAPACITY_REPORT.md` (lease gap B-02 separately open) |
@@ -267,7 +272,7 @@ Plus newly identified in this release (not in the v0.2.1 numbering):
 
 A signed document containing, per gate item: verdict, the command run, the observed
 output, and either a reproduction or the missing precondition. Plus, for each of
-`B-01`…`B-07` and every open A-item: agree, downgrade-with-argument, or reject. Any
+`B-01`…`B-08` and every open A-item: agree, downgrade-with-argument, or reject. Any
 Downgrade must be argued on the basis of demonstrated control, not convenience.
 
 Then, separately and before production: an **external penetration test** against a

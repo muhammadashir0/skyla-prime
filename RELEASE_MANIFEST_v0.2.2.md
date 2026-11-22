@@ -34,7 +34,7 @@ the conditions in §6.**
 |---|---|---|
 | 1 | `SECOND_HOST_VALIDATION.md` | **NOT VERIFIED** |
 | 2 | `CGROUPS_VALIDATION.md` | **PASS** (with §7 limits) |
-| 3 | `EGRESS_PROXY_ASSESSMENT.md` | **PASS** for the proxy; **NOT VERIFIED** for perimeter enforcement |
+| 3 | `EGRESS_PROXY_ASSESSMENT.md` | **PASS** for the proxy; **FAIL** for perimeter enforcement (B-01) |
 | 4 | `WAL_BACKUP_RECOVERY_REPORT.md` | **PASS** for backup/restore; **NOT VERIFIED** for scheduled operation |
 | 5 | `MULTI_WORKER_CAPACITY_REPORT.md` | **PASS** idempotency; **FAIL** auto worker recovery; **NOT VERIFIED** scheduler lease |
 | 6 | `CONNECTOR_RELIABILITY_REPORT.md` | **PASS** mock/live separation; **NOT VERIFIED** live providers |
@@ -45,17 +45,22 @@ the conditions in §6.**
 
 | Type | Count | Where |
 |---|---|---|
-| Automated tests, full suite | **304 passed, 16 skipped, 0 failed** (320 collected, 45 s) | `pytest tests/ -q -rs` |
-| Security test suite | 219 | `tests/security/` |
+| Automated tests, full suite | **322 passed, 18 skipped, 0 failed** (340 collected, 41 s) | `pytest tests/ -q -rs` |
+| Security test suite | 239 | `tests/security/` |
 | Live process/API deployments | 6 | 4-worker uvicorn, cgroup subtree, egress proxy, backup drill, connector stubs, mutation harness |
 | Independent probes (outside the suite) | ~25 | `/tmp/hostprobe.sh`, `/tmp/e2e_cgroup.py`, `/tmp/pidcheck.py`, `/tmp/mwprobe.py`, `/tmp/mwbench.py`, `/tmp/mwrecover2.py`, `/tmp/egress_probe.py`, `/tmp/thr.py` |
 | Kernel-counter measurements (not app-reported) | 12 | `memory.peak`, `memory.events`, `pids.peak`, `cpu.stat`, `cgroup.procs`, procfs caps/seccomp |
 
-The 16 skips are **all** `test_cgroups.py`, and all skip for one reason: the test
+The 18 skips are **all** `test_cgroups.py`, and all skip for one reason: the test
 process runs in `/user`, outside the delegated subtree `/sys/fs/cgroup/skyla`. They
-were run to completion (16/16 pass) inside the delegated subtree — see
+were run to completion (18/18 pass) inside the delegated subtree — see
 `CGROUPS_VALIDATION.md`. A skip reported as a pass would be exactly the failure mode
 this programme exists to prevent.
+
+That skip also hid a defect, which is why `tests/security/test_cgroup_failclosed.py`
+exists as a **separate, non-skipping** module: it needs no kernel privileges, and it
+caught a governor that returned a job object while every limit write had failed
+(§4, finding B-08).
 
 ## 3. Release gate — final state
 
@@ -64,7 +69,7 @@ this programme exists to prevent.
 | 1 | Host isolation independently verified | **NOT VERIFIED** | no second host obtainable; `SECOND_HOST_VALIDATION.md` |
 | 2 | Per-job + aggregate resource protection demonstrated | **PASS** | OOM `rc=-9` @128 MB, `pids.max` bounded, CPU throttled, 4th job refused; `CGROUPS_VALIDATION.md` |
 | 3 | Process-tree cleanup reliable | **PASS** | `cgroup.kill` + pid namespace; 0 survivors after timeout, incl. double-forked grandchild |
-| 4 | Egress demonstrably controlled | **PASS (proxy) / NOT VERIFIED (perimeter)** | pypi 200 via 48.9 MB tunnel; denied hosts refused before DNS; metadata blocked — but no host firewall, so B-01 |
+| 4 | Egress demonstrably controlled | **PASS** (proxy) / **FAIL** (perimeter, B-01) | pypi 200 via 48.9 MB tunnel; denied hosts refused before DNS; metadata blocked — but no host firewall exists, so the control is a chokepoint, not a perimeter |
 | 5 | Cross-user boundaries intact | **PASS** | 7/7 API attacks refused; record intact (v0.3.0 parity) |
 | 6 | DB integrity + backup restoration proven | **PASS** | `counts_match=True`, `critical_ok=True`, `schema_version=6`, `integrity_check ok`; **A-14 CLOSED** |
 | 7 | Multi-worker idempotency proven | **PASS** | 16 concurrent / 1 key → executed=1, replayed=15, 0×409; survives restart |
@@ -72,8 +77,10 @@ this programme exists to prevent.
 | 9 | Critical/High findings closed | **FAIL** | 0 Critical; **B-01, B-02 High open**; A-13/A-17/A-21/A-22 Medium open |
 | 10 | Independent external review completed | **NOT VERIFIED** | `INDEPENDENT_REVIEW_PACKAGE.md` has an empty sign-off block |
 
-**Gate result: 6 PASS (one conditional), 1 FAIL, 3 NOT VERIFIED.** Production
-requires all ten; the release is therefore **NO-GO for production**.
+**Gate result: 5 PASS, 2 FAIL, 3 NOT VERIFIED.** Production requires all ten; the
+release is therefore **NO-GO for production**. (Gate 4 passes as a proxy but fails
+as a perimeter, and is counted once on the failing side — counting the favourable
+reading of a split verdict is how a gate list becomes a marketing document.)
 
 ## 4. Findings ledger
 
@@ -84,6 +91,7 @@ requires all ten; the release is therefore **NO-GO for production**.
 | **A-14** | naive WAL copy loses all committed rows | **CLOSED** | SQLite online backup + verification + atomic publish; defect reproduced first as a regression test |
 | **A-29** | multi-process SQLite untested | **CLOSED** | 4-worker uvicorn on one WAL database; 47 req/s, `integrity_check ok` |
 | v0.3.0 cgroup gap | limits application-only | **CLOSED** | kernel enforcement wired into `NamespaceProvider.run()`; measured peaks |
+| **B-08** | cgroup governor failed **open**: `create_job()` / `ensure_aggregate()` ignored the result of every limit write, so a job whose `memory.max`, `pids.max`, `cpu.max` were absent was returned and reported to the API as `cgroup.enabled = true` | **CLOSED** | every write checked; a failed limit removes the cgroup and raises `CgroupUnavailable`; regression test `test_cgroup_failclosed.py` fails 13/15 on the old code |
 
 ### Open — High
 
@@ -114,8 +122,9 @@ because a replayed-`unknown` action can still become a duplicate external write.
    verified from kernel counters, and the API server survives beside it.
 2. A workload's process tree dies at timeout, including double-forked grandchildren,
    because `cgroup.kill` is used rather than a pid walk.
-3. Egress to a non-allowlisted destination is refused **before** a socket is opened,
-   and the connection is made to a vetted IP rather than a re-resolved name.
+3. Egress *passed to the proxy* to a non-allowlisted destination is refused **before**
+   a socket is opened, and the connection is made to a vetted IP rather than a
+   re-resolved name. (This does not prove that all egress passes the proxy — see B-01.)
 4. A backup taken during concurrent writes is consistent, checksummed, and restores
    to a database the application will accept — and the original is never touched.
 5. Two workers cannot independently execute the same external action; this holds
@@ -168,11 +177,11 @@ Staging is authorised **on this host only**, with:
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -q -rs              # 304 passed, 16 skipped
+python -m pytest tests/ -q -rs              # 322 passed, 18 skipped
 
 sudo scripts/cgroup_bootstrap.sh            # one-time delegation
 sudo scripts/skyla-run.sh --workers 4       # service inside the delegated subtree
-python -m pytest tests/security/test_cgroups.py -q   # 16 passed (no skips)
+python -m pytest tests/security/test_cgroups.py -q   # 18 passed (no skips)
 ```
 
 ## 10. Decision

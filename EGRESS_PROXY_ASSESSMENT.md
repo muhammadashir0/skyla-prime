@@ -7,10 +7,12 @@ blocking, connection-level validation, audit logging, per-task policy.
 ## Verdict
 
 > **PASS** for the proxy itself as measured below.
-> **NOT VERIFIED** for network-perimeter enforcement: nothing forces traffic through
-> the proxy at the host firewall level, because no firewall tooling is available on
-> this host (`iptables`, `nft` absent; apt blocked). The proxy is a *policy*
-> boundary that traffic must be routed to, not a hermetic network perimeter.
+> **FAIL** for network-perimeter enforcement: nothing forces traffic through the
+> proxy at the host firewall level, because no firewall tooling is available on this
+> host (`iptables`, `nft` absent; apt blocked). The proxy is a *policy* boundary that
+> traffic must be routed to, not a hermetic network perimeter. This is recorded as
+> finding **B-01 (High)**, not as "not verified" — the control is *absent*, which is
+> a known state, not an unknown one.
 
 ---
 
@@ -54,9 +56,9 @@ denial cannot itself be used to probe internal name resolution. Verified by
 | Requirement | Implementation | Evidence |
 |---|---|---|
 | Destination allowlisting | exact host or `*.suffix` wildcard; empty policy denies all | `test_empty_policy_denies_everything` |
-| DNS resolution checks | every A/AAAA record classified; one blocked record refuses the URL | `test_resolver_returning_metadata_ip_is_refused` |
+| DNS resolution checks | every resolved A/AAAA record is classified; **any** blocked record refuses the destination (`netguard.validate_url` raises inside the loop) | `test_ssrf.py::test_resolver_returning_metadata_ip_is_refused` — exercises `netguard`, which `EgressProxy.authorise()` calls directly |
 | Private-address restrictions | RFC1918, loopback, link-local, CGNAT, ULA, IPv4-mapped v6 unwrapped first | `test_private_destinations_denied_even_when_allowlisted` |
-| Redirect validation | `follow_redirects=False`; every hop re-vetted; >3 hops refused | `test_redirect_hop_is_revalidated` |
+| Redirect validation | proxy re-`authorise`s each request, so a redirect is a new decision; API-side `research.fetch_url` uses `follow_redirects=False` + `netguard.safe_redirect_chain` (max 3 hops) | `test_redirect_hop_is_revalidated`, `test_redirect_hop_cap` (`test_ssrf.py`) — the hop logic lives in `netguard`, not in the proxy |
 | DNS rebinding protection | dial the vetted IP, not the name | `test_connection_dials_the_vetted_ip_not_the_name` |
 | Cloud metadata blocking | `169.254.169.254`, `metadata.google.internal`, `.internal` | `test_private_destinations_denied_*`, `test_internal_service_name_denied` |
 | Internal service protection | private ranges + port allowlist `{80,443,8080,8443}` | `test_port_not_in_policy_is_refused` |
@@ -115,11 +117,12 @@ asserting `pypi.org -> 200`, which failed while the unit tests were green.
 
 ## 6. What is NOT verified
 
-* **No host firewall enforcement.** `iptables`/`nft` are absent and apt is blocked,
-  so egress cannot be *forced* through the proxy. A process that ignores
+* **No host firewall enforcement — B-01, High.** `iptables`/`nft` are absent and apt
+  is blocked, so egress cannot be *forced* through the proxy. A process that ignores
   `HTTPS_PROXY` and dials directly is not stopped by this layer. In production the
   proxy must be the only permitted egress route (network namespace + firewall rule
-  `DROP` for all other destinations), and that rule is **NOT VERIFIED** here.
+  `DROP` for all other destinations). That rule does not exist here: this is **FAIL**,
+  not an untested control.
 * **No DNS pinning at the socket layer beyond the vetted IP the proxy dials.** The
   proxy dials the vetted IP, but `netguard.validate_url()` (used by the API-side
   fetchers) still hands a hostname to `httpx`, so the API-side path retains a small
@@ -136,7 +139,7 @@ asserting `pypi.org -> 200`, which failed while the unit tests were green.
 
 | Risk | Severity | Note |
 |---|---|---|
-| Traffic can bypass the proxy (no firewall) | High | closes only with host-level egress rules |
+| Traffic can bypass the proxy (no firewall) — **B-01** | High | closes only with host-level egress rules; blocks release gate 4 |
 | API-side fetchers keep a rebinding window | Medium | route them through the proxy |
 | Content is not inspected | Medium | destination policy only; no DLP |
 | Single proxy instance, no HA | Low | acceptable for staging |
