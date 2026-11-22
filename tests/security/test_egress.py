@@ -273,3 +273,44 @@ def test_live_denied_host_never_reaches_the_network():
         assert not [d for d in p.audit.recent() if d["host"] == "github.com" and d["allowed"]]
     finally:
         p.stop()
+
+
+# ---------------------------------------------------------------------------
+# v0.2.6 regressions: two silent bugs found while closing FW-01.
+# ---------------------------------------------------------------------------
+
+def test_capability_union_authorise_returns_a_vetted_ip():
+    """A permitted host must come back with an address, not an empty string.
+
+    The multi-capability union branch used to return ``""`` as the vetted IP.
+    The caller then dialled ``("", port)``, which fails with "Name or service not
+    known" and is reported as "upstream unreachable" — so a correct policy
+    decision surfaced as a network fault and hid the real cause for hours.
+    """
+    policy = POLICIES["api-egress"]
+    p = EgressProxy(policy=policy, require_auth=False, audit=EgressAudit())
+    host = "example.com"                       # in the api-egress union
+    ok, reason, ip = p.authorise(host, 443, "CONNECT", "", "")
+    assert ok, reason
+    assert ip, f"permitted host {host} returned no vetted IP (reason={reason!r})"
+    # It must be a real, parseable address and not the hostname echoed back.
+    socket.inet_pton(socket.AF_INET if ":" not in ip else socket.AF_INET6, ip)
+
+
+def test_validate_url_prefers_ipv4_when_both_families_resolve():
+    """The gateway is IPv4-only, so a dual-stack name must vet to its A record.
+
+    Dialling the AAAA record fails at connect() even though the policy decision
+    was right, which again reads as "upstream unreachable".
+    """
+    from skyla.netguard import validate_url
+
+    def resolver(host, port, **kw):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+        ]
+
+    vetted = validate_url("https://example.com:443/", resolver=resolver)
+    assert ":" not in vetted.ip, f"expected an IPv4 address, got {vetted.ip}"
+    assert vetted.ip == "93.184.216.34"

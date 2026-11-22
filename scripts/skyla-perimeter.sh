@@ -82,6 +82,41 @@ status)
     ip netns exec "$NS" ip route 2>/dev/null || true
     ip netns exec "$NS" ip -brief addr 2>/dev/null || true
     ;;
+proxy-ns)
+    # v0.2.6: run the egress proxy INSIDE the gateway namespace (closes FW-01).
+    #
+    # Why this location and not the host: a host-namespace proxy sends its
+    # upstream connections through the host OUTPUT chain, where SKYLA-EGRESS ends
+    # in DROP. Forwarded traffic from the gateway namespace takes the FORWARD
+    # hook instead, which the host policy opens narrowly (443/853 only). So the
+    # host OUTPUT policy stays fully strict and the proxy still reaches upstream.
+    #
+    # The proxy binds the GATEWAY-FACING address (10.200.0.1), which is the only
+    # peer the API namespace can route to. It does not bind 10.201.0.1 any more,
+    # so there is no longer a proxy socket in the host namespace at all.
+    exec ip netns exec "$GW" env \
+        SKYLA_EGRESS_BIND="${SKYLA_EGRESS_BIND:-10.200.0.1}" \
+        SKYLA_EGRESS_PORT="$PROXY_PORT" \
+        PYTHONPATH="$ROOT" \
+        "$PY" - "$ROOT" "$PROXY_PORT" <<'EOF'
+import os, sys, time
+root, port = sys.argv[1], int(sys.argv[2])
+sys.path.insert(0, root)
+from skyla.egress import EgressProxy, POLICIES
+bind = os.environ.get("SKYLA_EGRESS_BIND", "10.200.0.1")
+policy = POLICIES[os.getenv("SKYLA_EGRESS_POLICY", "api-egress")]
+secret = os.getenv("SKYLA_EGRESS_SECRET", "")
+p = EgressProxy(host=bind, port=port, policy=policy,
+                share_secret=secret, require_auth=True).start()
+print(f"egress proxy on {p.host}:{p.port} in namespace {os.environ.get('SKYLA_NS','?')} "
+      f"policy={policy.name}", flush=True)
+try:
+    while True:
+        time.sleep(3600)
+except KeyboardInterrupt:
+    p.stop()
+EOF
+    ;;
 proxy)
     # The workload can reach exactly one address — the gateway — and the gateway
     # DNATs one port to the host. So the proxy must listen on the HOST side of the

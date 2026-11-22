@@ -154,6 +154,12 @@ def validate_url(url: str, *, allow_loopback: bool = False,
     if not vetted:
         raise SSRFBlocked(f"'{host}' has no usable address")
 
+    # Prefer IPv4 when the resolver offered both families. The egress gateway is
+    # IPv4-only by design, so dialling an AAAA record fails at connect time even
+    # though the policy decision was correct — and the caller then reports the
+    # failure as "upstream unreachable", which misattributes it to the network.
+    vetted.sort(key=lambda a: 0 if ":" not in a else 1)
+
     return VettedURL(url=url, host=host, port=port,
                      scheme=parts.scheme.lower(), ip=vetted[0])
 

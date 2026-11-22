@@ -340,7 +340,18 @@ class EgressProxy:
                     if alt and alt.host_permitted(host) and port in alt.allow_ports \
                             and (method.upper() == "CONNECT"
                                  or method.upper() in alt.allow_methods):
-                        return True, f"allowed by '{alt_name}'", ""
+                        # Resolve here too. Returning a bare "" made the caller
+                        # dial ("", 443), which fails with "Name or service not
+                        # known" and is reported as "upstream unreachable" — a
+                        # misleading verdict that hid a correct policy decision.
+                        try:
+                            vetted = validate_url(
+                                f"https://{host}:{port}/" if port in (443, 8443)
+                                else f"http://{host}:{port}/",
+                                allowed_ports=set(alt.allow_ports))
+                        except SSRFBlocked as exc:
+                            return False, f"address check failed: {exc}", ""
+                        return True, f"allowed by '{alt_name}'", vetted.ip
             return False, f"host '{host}' not in policy '{policy.name}'", ""
         if port not in policy.allow_ports:
             return False, f"port {port} not permitted", ""
