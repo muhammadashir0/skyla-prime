@@ -413,18 +413,47 @@ class Database:
 
     # -- idempotency ledger (WS3) --------------------------------------
     def ledger_begin(self, key: str, fingerprint: str, connector: str, operation: str) -> dict:
-        """Claim an idempotency key. Returns {status: new|duplicate|conflict, record}."""
-        existing = self.query_one("SELECT * FROM action_ledger WHERE idempotency_key=?", (key,))
-        if existing:
-            if existing["fingerprint"] != fingerprint:
-                return {"status": "conflict", "record": dict(existing)}
-            return {"status": "duplicate", "record": dict(existing)}
+        """Atomically claim an idempotency key. Returns {status, record}.
+
+        status is one of:
+          new        - this caller owns the action
+          duplicate  - the same request was already accepted
+          conflict   - the same key was used with a different fingerprint
+          in_flight  - another worker holds the claim and has not finished
+
+        v0.2.2: this must be correct ACROSS PROCESSES, not merely within one. The
+        previous implementation was check-then-insert: two API workers could both
+        read "no row" and both insert, so both would proceed to perform the external
+        action. Uniqueness was saved by the UNIQUE constraint, but the loser got an
+        uncaught IntegrityError instead of a duplicate result (measured: 5 of 6
+        concurrent workers crashed).
+
+        The claim is now a single INSERT whose outcome decides ownership. SQLite
+        serialises writers, so exactly one INSERT can succeed; every other caller
+        observes the existing row via the IntegrityError path and is told what it
+        is. There is no window between check and claim.
+        """
         lid = f"op_{uuid.uuid4().hex[:10]}"
         now = time.time()
-        self.execute(
-            "INSERT INTO action_ledger (id,idempotency_key,fingerprint,connector,operation,state,attempts,created_at,updated_at)"
-            " VALUES (?,?,?,?,?,?,0,?,?)",
-            (lid, key, fingerprint, connector, operation, "pending", now, now))
+        try:
+            self.execute(
+                "INSERT INTO action_ledger (id,idempotency_key,fingerprint,connector,"
+                "operation,state,attempts,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,0,?,?)",
+                (lid, key, fingerprint, connector, operation, "pending", now, now))
+        except sqlite3.IntegrityError:
+            # Lost the race (or the key already existed): read the winner.
+            existing = self.query_one(
+                "SELECT * FROM action_ledger WHERE idempotency_key=?", (key,))
+            if not existing:
+                # Constraint fired but no row is visible: do not proceed.
+                return {"status": "in_flight", "record": {"id": "", "state": "unknown"}}
+            record = dict(existing)
+            if existing["fingerprint"] != fingerprint:
+                return {"status": "conflict", "record": record}
+            if existing["state"] == "pending":
+                return {"status": "in_flight", "record": record}
+            return {"status": "duplicate", "record": record}
         return {"status": "new", "record": {"id": lid, "state": "pending"}}
 
     def ledger_complete(self, key: str, state: str, provider_response: str = "") -> None:
@@ -432,6 +461,27 @@ class Database:
             "UPDATE action_ledger SET state=?, provider_response=?, attempts=attempts+1, updated_at=?"
             " WHERE idempotency_key=?",
             (state, provider_response, time.time(), key))
+
+    def ledger_reap_stale(self, older_than_s: float = 300.0) -> list[str]:
+        """Recover claims abandoned by a crashed worker.
+
+        A worker that dies between ledger_begin() and ledger_complete() leaves a
+        'pending' row forever, which would block that idempotency key for good.
+        Claims older than `older_than_s` are marked 'unknown' so a retry can
+        proceed, and the operator can see what was interrupted.
+        """
+        cutoff = time.time() - older_than_s
+        rows = self.query(
+            "SELECT idempotency_key FROM action_ledger"
+            " WHERE state='pending' AND updated_at < ?", (cutoff,))
+        keys = [r["idempotency_key"] for r in rows]
+        for key in keys:
+            self.execute(
+                "UPDATE action_ledger SET state='unknown', updated_at=? "
+                "WHERE idempotency_key=? AND state='pending'", (time.time(), key))
+        if keys:
+            self.audit("system", "idempotency.reaped", f"count={len(keys)}")
+        return keys
 
     def ledger_get(self, key: str) -> dict | None:
         r = self.query_one("SELECT * FROM action_ledger WHERE idempotency_key=?", (key,))

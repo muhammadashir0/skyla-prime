@@ -3,13 +3,23 @@ from skyla.core.context import ContextManager, estimate_tokens, truncate
 
 
 def test_ledger_new_duplicate_conflict(db):
+    """v0.2.2 tightened this contract for multi-worker correctness.
+
+    Before completion the key IS in flight: a second worker must be told that, not
+    told "duplicate", because replaying a result that does not exist yet would
+    return an empty body and the caller might proceed to act.
+    """
     r1 = db.ledger_begin("k1", "fp-a", "telegram", "message.send")
     assert r1["status"] == "new"
     r2 = db.ledger_begin("k1", "fp-a", "telegram", "message.send")
-    assert r2["status"] == "duplicate"
+    assert r2["status"] == "in_flight", "a pending claim must report in_flight"
     r3 = db.ledger_begin("k1", "fp-b", "telegram", "message.send")
     assert r3["status"] == "conflict"
     db.ledger_complete("k1", "completed", "provider-msg-123")
+    # Once settled, the same request is a genuine duplicate with a replayable body.
+    r4 = db.ledger_begin("k1", "fp-a", "telegram", "message.send")
+    assert r4["status"] == "duplicate"
+    assert r4["record"]["provider_response"] == "provider-msg-123"
     rec = db.ledger_get("k1")
     assert rec["state"] == "completed" and rec["attempts"] == 1
 

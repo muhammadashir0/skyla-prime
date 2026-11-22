@@ -621,13 +621,24 @@ def _ledger_guard(key: str | None, fingerprint: str, connector: str, operation: 
     if not key:
         return None
     claim = db.ledger_begin(key, fingerprint, connector, operation)
+    # A fresh claim must NOT return a replay body. Returning None is also what
+    # callers check for, so the distinction has to be explicit: a duplicate whose
+    # recorded response is empty would otherwise replay {} and be skipped by
+    # `if replay:` at the call site, letting the action execute a second time.
+    if claim["status"] == "new":
+        return None
     if claim["status"] == "conflict":
         db.audit("system", "idempotency.conflict", f"{connector}.{operation} key={key}")
         raise HTTPException(409, "Idempotency key reused with different payload")
+    if claim["status"] == "in_flight":
+        # Another worker holds the claim. Refusing here is what guarantees two
+        # workers cannot both perform the same external action.
+        db.audit("system", "idempotency.in_flight", f"{connector}.{operation} key={key}")
+        raise HTTPException(409, "Operation with this idempotency key is in flight",
+                            headers={"Retry-After": "2"})
     if claim["status"] == "duplicate":
         rec = claim["record"]
         if rec["state"] == "pending":
-            # Another request holds this key and has not finished yet.
             raise HTTPException(409, "Operation with this idempotency key is in flight")
         replay: dict = {}
         if rec.get("provider_response"):
@@ -660,7 +671,7 @@ async def wf_meeting(body: MeetingRequest, authorization: str | None = Header(No
     _require_connector_write(user, "google-calendar", scopes)
     _require_trusted_action(user, "connector:write", f"{body.attendee}|{body.autonomy_level}")
     replay = _ledger_guard(body.idempotency_key, fp, "google-calendar", "event.create")
-    if replay:
+    if replay is not None:
         return replay
     result = await workflow_meeting(calendar, body.attendee, body.autonomy_level)
     if body.idempotency_key:
@@ -686,7 +697,7 @@ async def wf_telegram(body: TelegramRequest, authorization: str | None = Header(
     _require_connector_write(user, "telegram", scopes)
     _require_trusted_action(user, "connector:write", f"{body.chat_id}|{body.text}")
     replay = _ledger_guard(body.idempotency_key, fp, "telegram", "message.send")
-    if replay:
+    if replay is not None:
         return replay
     result = await workflow_telegram_command(body.text, telegram, body.chat_id)
     if body.idempotency_key:
@@ -711,7 +722,7 @@ async def wf_gmail_draft(body: GmailDraftRequest, authorization: str | None = He
     _require_connector_write(user, "gmail", scopes)
     _require_trusted_action(user, "connector:write", f"{body.message_id}|{body.body}")
     replay = _ledger_guard(body.idempotency_key, fp, "gmail", "draft.create")
-    if replay:
+    if replay is not None:
         return replay
     try:
         result = await gmail.draft_reply(body.message_id, body.body)
