@@ -163,6 +163,31 @@ SKYLA_DB_PATH=/tmp/mw/app.db SKYLA_INIT_DB=1 \
   python -m uvicorn skyla.api.app:app --port 8031 --workers 4
 ```
 
+**Use the real route paths.** The idempotent connector endpoints are
+`POST /api/workflows/telegram`, `/api/workflows/gmail/draft` and
+`/api/workflows/meeting`; health is `/api/health`, not `/health`. A probe
+aimed at `/api/connectors/telegram/send` returns 404 for all requests, which reads
+like "16 executed, 0 replayed" if the harness counts 404s as executions — a false
+PASS in the most dangerous direction. The probe below asserts on the `duplicate`
+flag of a `200`, not on the status code alone.
+
+End-to-end reproduction (fresh database, 4 workers, admin credential from
+`bootstrap_admin_credential.txt`, which is `username=…/password=…` not a token):
+
+```
+GET  /api/health                    -> 200
+POST /api/auth/login                -> 200, token
+16x  POST /api/workflows/telegram   (same idempotency key, concurrently)
+  statuses : {200: 16}
+  executed : 1      replayed : 15
+  ledger   : 1 row, state=completed
+  PRAGMA integrity_check : ok
+  body     : {"mode":"mock","status":"logged-not-sent", ...}
+```
+
+Note the mock status in the response: the point of the probe is the ledger
+behaviour, and the connector still refuses to claim a real send.
+
 ## 8. Residual risk
 
 | Risk | Severity | Note |
