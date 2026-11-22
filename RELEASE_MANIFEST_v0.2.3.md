@@ -6,7 +6,7 @@
 - Tag candidate: `v0.2.3`
 - Branch: `arena/2a497c0e-skyla-prime`
 - Base: `cb4cfce` (`main`)
-- HEAD: **`ad53336`**
+- HEAD: **`0a44454`**
 - Date: 2026-11-22
 - Suite: **341 passed, 31 skipped** (372 collected), unprivileged, 55.2 s
 
@@ -62,7 +62,7 @@ b4ba0a8  v0.2.3 B-02: cross-process task execution lease (High, closed)
 | 11 | Multi-worker idempotency | **PASS** | LEASE-11…12 |
 | 12 | Live connectors | **NOT VERIFIED** | `LIVE_CONNECTOR_VALIDATION.md` |
 | 13 | No unresolved critical/high | **FAIL** | A-13, A-17, A-21, A-22, B-03…B-07 open; NET-24 partial |
-| 14 | Final tree passes the suite | **PASS** | 341 passed / 31 skipped at `ad53336` |
+| 14 | Final tree passes the suite | **PASS** | 341 passed / 31 skipped at `0a44454` |
 
 **Counts over 14 controls: 7 PASS · 2 PARTIAL (rows 1 and 8) · 1 FAIL (row 13) · 3 NOT VERIFIED (rows 3, 4, 12) = 13 rows; row 13's FAIL is the aggregate of the open findings, and row 1's PARTIAL is B-01.**
 

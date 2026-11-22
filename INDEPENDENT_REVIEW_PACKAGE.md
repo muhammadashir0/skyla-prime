@@ -77,7 +77,7 @@ Declared up front so the review spends its effort on what is not listed:
 
 ```bash
 git clone <repo> && cd skyla-prime
-git checkout ad53336
+git checkout 0a44454
 
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 

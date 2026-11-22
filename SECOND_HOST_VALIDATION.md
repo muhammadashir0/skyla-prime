@@ -62,7 +62,7 @@ These are properties of *this* host that a second host would very likely not sha
 ## 4. What is needed to close this gate
 
 1. A Linux host that is **not** this machine — a VM or physical box is acceptable; a container on this kernel is not.
-2. A **clean clone** of commit `ad53336` (or later), with `pip install -e ".[dev]"` into a fresh virtualenv, so no artefact of this host's build leaks in.
+2. A **clean clone** of commit `0a44454` (or later), with `pip install -e ".[dev]"` into a fresh virtualenv, so no artefact of this host's build leaks in.
 3. Native components built **from source** on that host.
 4. `scripts/cgroup_bootstrap.sh` as root, then the full suite **unprivileged**, plus the perimeter file **as root**.
 5. The table in §3 filled in from that host, with every divergence explained.
