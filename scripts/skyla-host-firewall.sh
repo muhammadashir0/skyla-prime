@@ -280,6 +280,20 @@ verify() {
         echo "  FAIL  $CHAIN has no DROP rule"; fail=1
     fi
 
+    # A DROP rule is worthless if something above it accepts everything. An
+    # unconstrained ACCEPT (no -s/-d, no -p, no -o, no ctstate) makes the whole
+    # chain permissive while every other check still passes — measured: the
+    # host reached github.com:443 with such a rule sitting at position 1.
+    rogues=$("$IPT" -S "$CHAIN" | grep -E '^-A ' | grep -E -- '-j (ACCEPT|RETURN)$' \
+             | grep -vE -- '(-s|-d|-p|-i|-o|--ctstate|--dport|--sport) ' || true)
+    if [ -n "$rogues" ]; then
+        echo "  FAIL  $CHAIN contains an unconstrained accept:"
+        printf '%s\n' "$rogues" | sed 's/^/          /' 
+        fail=1
+    else
+        echo "  PASS  no unconstrained accept in $CHAIN"
+    fi
+
     [ "$fail" = "0" ] && echo "VERIFY: PASS" || { echo "VERIFY: FAIL"; return 1; }
 }
 
