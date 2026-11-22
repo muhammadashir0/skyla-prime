@@ -1,6 +1,6 @@
 # Network Perimeter Assessment — v0.2.3 Mission B
 
-**Status: B-01 REMEDIATED for the API process. Two of the ten required properties remain NOT MET (host-wide firewall; OS-enforced per-process confinement of the trusted process). Production remains NO-GO on those two.**
+**Status: B-01 CLOSED. 9 of the 10 required properties PASS; NET-23 (host-wide default-deny) remains NOT DEPLOYED — corrected from an earlier, mistaken "impossible". Production remains NO-GO on NET-23 and the other outstanding gates.**
 
 - Finding: **B-01 (High)** in `EGRESS_PROXY_ASSESSMENT.md`
 - Remediating commits: `5201853` (perimeter), `ad53336` (status reporting), and the proxy-bind change in this commit
@@ -81,7 +81,7 @@ Judged from **inside the execution workload**, by attempting real connections �
 | # | Property | Verdict | How it was tested | Evidence |
 |---|---|---|---|---|
 | 1 | Deny unauthorised outbound | **PASS** | `create_connection` to `1.1.1.1:53`, `8.8.8.8:53` from inside → `OSError`; the same probe on the host → `REACHED` | `test_public_and_metadata_destinations_are_unreachable` |
-| 2 | Prevent proxy bypass | **PARTIAL** | Inside the workload, a direct dial has nowhere to go (no default route): bypass is structurally impossible. **But** the *API process* is still not OS-confined — `run_confined()` is available and not yet on the API's own outbound path. See §7 | `test_workload_namespace_has_no_default_route` |
+| 2 | Prevent proxy bypass | **PASS** | The API process is confined and every outbound call goes through the factory; a direct dial has no route from either the workload namespace or the API. See §7b | `test_the_api_namespace_cannot_reach_the_internet_directly`, `test_the_client_is_bound_...` |
 | 3 | Restrict IPv4 **and** IPv6 | **PASS** | `ip -6 route` inside → empty; `net.ipv6.conf.all.disable_ipv6=1` in both namespaces | `test_workload_namespace_has_no_ipv6_path` |
 | 4 | Block private / link-local | **PASS** | `10.201.0.1:8200` (host, `0.0.0.0`-bound), `10.201.0.1:8201` (host loopback), `10.201.0.2:8200` → all unreachable | `test_internal_services_are_unreachable_from_the_workload` |
 | 5 | Block metadata endpoints | **PASS** | `169.254.169.254:80` (AWS and GCP profiles) from inside → `OSError` (`ENETUNREACH`); through the proxy → **403** | same + `prove_proxy_reachable` |
@@ -119,22 +119,36 @@ Each mutation was removed and the clean state re-verified (`14 passed, 2 skipped
 
 ## 7. What is NOT achieved, and why — still NOT MET
 
-### 7a. Host-wide firewall ruleset — NOT MET (environment blocker)
+### 7a. Host-wide firewall ruleset — NOT MET (**corrected: not impossible, merely not deployed**)
 
-The required control is a host-level default-deny. It could not be built:
+**Correction, recorded because the earlier version of this section was wrong.**
 
-- `nft` and `iptables` binaries are absent from the image.
-- No `python-nftables` binding is installable (package index egress is restricted).
-- A direct `libnftables.so.1` netlink write fails: `Error: Could not process rule: No such file or directory`, **as uid 0, with `CapEff 000001ffffffffff`, and inside a freshly created netns**.
-- `NETLINK_NETFILTER` sockets can be created, and `list ruleset` succeeds — so this is not an API misuse; loading a ruleset is blocked.
+An earlier revision of this document stated that `nft`/`iptables` were absent and that rulesets could not be loaded. That was a **PATH artifact, not a capability limit**:
 
-This is the sandbox's own boundary. The delivered perimeter does **not** depend on netfilter for isolation — it depends on the route table — which is why B-01 can be remediated anyway. It is recorded as an unmet *host-firewall* requirement, not as a pass.
+```
+$ command -v iptables            # unprivileged PATH
+(nothing)
+$ sudo sh -c 'command -v iptables; command -v nft'
+/usr/sbin/iptables
+/usr/sbin/nft
 
-### 7b. The API process is not yet OS-confined end to end — PARTIAL
+$ sudo iptables -A OUTPUT -d 203.0.113.99 -j DROP && sudo iptables -S OUTPUT
+-P OUTPUT ACCEPT
+-A OUTPUT -d 203.0.113.99/32 -j DROP          <- applied successfully
+$ sudo ip6tables -A OUTPUT -d 2001:db8::99 -j DROP && …   <- also applied
+```
 
-`run_confined()` exists and is proven, but the API's own outbound calls do not yet go through it: `skyla/api/app.py` has **no egress reference at all** (`grep -c "egress\|proxy" skyla/api/app.py` → `0`), and the proxy is only started when `SKYLA_EGRESS_ENABLED=1` is set explicitly.
+`iptables` v1.8.9 (nf_tables backend) and `ip6tables` both work at host level. `nft` works in the **`ip` family**; the `inet` family returns `Operation not supported` here, which is what produced the earlier "Could not process rule" errors and, joined with the missing PATH entry, the mistaken conclusion.
 
-Honest statement of the gap: **the boundary exists and is proven; it is not yet the mandatory path for the trusted process.** Until the API is started inside the perimeter or its outbound calls are routed through `run_confined()`, property 2 is PARTIAL rather than PASS. This is a wiring task with no remaining unknown, but it is not done, so it is not claimed.
+**What is still true:** no host-wide default-deny ruleset is deployed. Other processes on this host retain free egress. The API itself is confined (see §7b), so B-01's specific exposure is closed, but the host-level control remains outstanding work — not a blocked one.
+
+This correction matters: "impossible" closes an item; "not deployed" leaves it as real work with a known implementation path.
+
+### 7b. The API process — **now CLOSED** (was PARTIAL)
+
+This gap is closed at `5bace07`. The API runs inside the perimeter, every outbound call goes through `skyla/egress_client.py`, and it refuses to start without the boundary. Verified from the live unprivileged process: only `10.200.0.1:8155` is reachable; internet, metadata, host `0.0.0.0` services, host loopback and IPv6 all fail.
+
+Full evidence: `B01_API_EGRESS_INTEGRATION.md`, `B01_REMEDIATION_EVIDENCE.md`, `API_EGRESS_SECURITY_TESTS.md`. Property 2 below is now **PASS**.
 
 ## 8. Reproducing this assessment
 
@@ -172,6 +186,6 @@ venv/bin/python -m pytest tests/security/test_network_perimeter.py -q
 | Does the proxy still allow legitimate egress? | **Yes** — `pypi.org` → 200, `github.com` → 403 |
 | Is the trusted API process OS-confined? | **Not yet** — boundary proven, wiring pending (§7b) |
 | Is there a host-wide firewall? | **No** — environment blocker (§7a) |
-| **B-01 closed?** | **Closed for the execution workload; PARTIAL for the trusted process.** The finding's substance — "nothing forces traffic through the proxy" — is answered by a structural boundary, but the trusted process is not yet inside it. |
+| **B-01 closed?** | **Yes.** The trusted API process is constrained, verified in situ, and fails closed. |
 
 Production stays **NO-GO** on §7a and §7b until both are resolved or accepted in writing.

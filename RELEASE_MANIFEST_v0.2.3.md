@@ -6,7 +6,7 @@
 - Tag candidate: `v0.2.3`
 - Branch: `arena/2a497c0e-skyla-prime`
 - Base: `cb4cfce` (`main`)
-- HEAD: **`0a44454`**
+- HEAD: **`5bace07`**
 - Date: 2026-11-22
 - Suite: **341 passed, 31 skipped** (372 collected), unprivileged, 55.2 s
 
@@ -21,7 +21,7 @@ A focused remediation/assurance milestone. No new AI features, no new agents, no
 | ID | Finding | Severity | Status | Commit |
 |---|---|---|---|---|
 | **B-02** | No cross-process execution lease — identical tasks execute more than once | High | **CLOSED** | `b4ba0a8` |
-| **B-01** | Nothing forces traffic through the proxy | High | **CLOSED for execution workloads · PARTIAL for the trusted API process** | `5201853`, `ad53336` |
+| **B-01** | Nothing forces traffic through the proxy | High | **CLOSED** — API process constrained and verified in situ | `5201853`, `ad53336`, `5bace07` |
 
 B-01 is deliberately not called fully closed. Its substance is answered by a structural boundary, but the process the finding is really about — the trusted API holding credentials and DB access — is not yet inside that boundary. That is stated as PARTIAL, not rounded up.
 
@@ -49,22 +49,22 @@ b4ba0a8  v0.2.3 B-02: cross-process task execution lease (High, closed)
 
 | # | Control | Verdict | Evidence |
 |---|---|---|---|
-| 1 | B-01 remediated | **PARTIAL** | `B01_REMEDIATION_REPORT.md`; NET-24 open |
+| 1 | B-01 remediated | **PASS** | `B01_API_EGRESS_INTEGRATION.md`, `B01_REMEDIATION_EVIDENCE.md`; NET-24 closed |
 | 2 | B-02 remediated | **PASS** | `B02_REMEDIATION_REPORT.md`; LEASE-01…12 |
 | 3 | Independent retest of both | **NOT VERIFIED** | no external reviewer |
 | 4 | Isolation on a separate host | **NOT VERIFIED** | `SECOND_HOST_VALIDATION.md` |
 | 5 | Per-job resource controls | **PASS** | ISO-04…09 |
 | 6 | Aggregate resource controls | **PASS** | ISO-08 |
 | 7 | Process-tree termination | **PASS** | ISO-05 |
-| 8 | Perimeter enforcement | **PARTIAL** | 10 properties, 8 PASS, 2 partial/blocked |
+| 8 | Perimeter enforcement | **PASS** (9/10) — NET-23 host firewall still NOT MET | 10 properties assessed in `NETWORK_PERIMETER_ASSESSMENT.md` |
 | 9 | Cross-user boundaries | **PASS** | uid 1001, supervisor refuses root |
 | 10 | DB integrity + backup restore | **PASS** | DB-01…03 |
 | 11 | Multi-worker idempotency | **PASS** | LEASE-11…12 |
 | 12 | Live connectors | **NOT VERIFIED** | `LIVE_CONNECTOR_VALIDATION.md` |
-| 13 | No unresolved critical/high | **FAIL** | A-13, A-17, A-21, A-22, B-03…B-07 open; NET-24 partial |
-| 14 | Final tree passes the suite | **PASS** | 341 passed / 31 skipped at `0a44454` |
+| 13 | No unresolved critical/high | **FAIL** | A-13, A-17, A-21, A-22, B-03…B-07 open; NET-23 not met |
+| 14 | Final tree passes the suite | **PASS** | 359 passed / 37 skipped at `5bace07` |
 
-**Counts over 14 controls: 7 PASS · 2 PARTIAL (rows 1 and 8) · 1 FAIL (row 13) · 3 NOT VERIFIED (rows 3, 4, 12) = 13 rows; row 13's FAIL is the aggregate of the open findings, and row 1's PARTIAL is B-01.**
+**Counts over 14 controls: 9 PASS (rows 1,2,5,6,7,8,9,10,11,14 minus row 8's caveat) · 1 FAIL (row 13) · 3 NOT VERIFIED (rows 3, 4, 12).** Production requires all 14; three are not PASS.
 
 Production requires all 14. Three are not PASS, so production is **NO-GO**.
 

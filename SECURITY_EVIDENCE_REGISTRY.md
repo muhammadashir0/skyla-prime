@@ -4,10 +4,10 @@ Every significant security claim in the v0.2.3 documents maps to one record here
 
 **Status values:** `PASS` (measured, test exists, mutation-sensitive) · `FAIL` (measured and failing) · `NOT VERIFIED` (could not be measured — includes skips)
 
-**Last verified commit:** `ad53336` · **Environment:** `e2b.local`, Debian 12, kernel 6.1.158+, 2 vCPU, 3939 MB, cgroup v2, Landlock ABI 2, Python 3.11.2, SQLite 3.40.1, uvicorn 0.54.0
+**Last verified commit:** `5bace07` · **Environment:** `e2b.local`, Debian 12, kernel 6.1.158+, 2 vCPU, 3939 MB, cgroup v2, Landlock ABI 2, Python 3.11.2, SQLite 3.40.1, uvicorn 0.54.0
 
 **Repro command shorthand**
-- `SUITE` = `/tmp/env3/bin/python -m pytest tests/ -q` (unprivileged, 341 passed / 31 skipped)
+- `SUITE` = `/tmp/env3/bin/python -m pytest tests/ -q` (unprivileged, 359 passed / 37 skipped)
 - `SUITE_ROOT` = `sudo -n /tmp/env3/bin/python -m pytest tests/security/test_network_perimeter.py -q` (root — **only the perimeter file**)
 
 > **The full suite MUST run unprivileged.** As root, 32 unit/security tests fail by
@@ -50,6 +50,35 @@ Every significant security claim in the v0.2.3 documents maps to one record here
 | NET-22 | Perimeter refuses the leaky single-veth topology | `run_confined` | internal leak | `test_run_confined_requires_both_namespaces` | `SUITE` | raises | raised | — | n/a | **PASS** |
 | **NET-23** | **Host-wide nftables/iptables default-deny** | **none** | **unconstrained host egress** | — | attempted | ruleset loads | `Could not process rule: No such file or directory` as uid 0, CapEff `1ffffffffff`, fresh netns | — | — | **NOT VERIFIED (blocked)** |
 | **NET-24** | **API process OS-confined end to end** | **`perimeter.run_confined` (unused by API)** | **trusted-process egress** | — | `grep -c "egress\|proxy" skyla/api/app.py` = **0** | wired | **not wired** | — | — | **PARTIAL → FAIL as a mandatory control** |
+
+## A2. API egress integration (mission B — B-01 closure, commit `5bace07`)
+
+The B-01 record set below is **additional** to `NET-01…NET-24`; those are unchanged. These records cover the API process specifically, which the NET records did not.
+
+| ID | Claim | Impl | Threat | Test | Repro | Expected | Actual | Mutation | Detected | Status |
+|---|---|---|---|---|---|---|---|---|---|---|
+| API-01 | The API process runs inside the perimeter | deployment | unconstrained trusted process | live `nsenter` probe | `nsenter -t $PID -n` | confined inode | `net:[4026532280]`, uid 1001 | — | n/a | **PASS** |
+| API-02 | API cannot reach the internet directly | namespace routing | dependency exfiltration | `test_the_api_namespace_cannot_reach_the_internet_directly` | `SUITE_ROOT` | `OSError` | `OSError` (1.1.1.1, 8.8.8.8) | M2 default route | **yes** | **PASS** |
+| API-03 | API cannot reach metadata | namespace routing | credential theft | same + live probe | `SUITE_ROOT` | `OSError` | `OSError`; `403` via proxy | M2 | **yes** | **PASS** |
+| API-04 | API cannot reach host `0.0.0.0` services | gateway topology | lateral movement to API | `test_the_api_namespace_cannot_reach_internal_services` | `SUITE_ROOT` | unreachable | `OSError`, `403` via proxy | — | n/a | **PASS** |
+| API-05 | API cannot reach host loopback | gateway topology | host-local services | live probe | `SUITE_ROOT` | unreachable | `OSError` | — | n/a | **PASS** |
+| API-06 | API has no IPv6 path | namespace config | v6 bypass | `test_the_api_namespace_has_no_ipv6_path` | `SUITE_ROOT` | `ip -6 route` empty | empty; `::1` `OSError` | — | n/a | **PASS** |
+| API-07 | All 11 outbound call sites use the factory | `egress_client.py` | unguarded client | `grep` + review | inventory §5 | 0 direct in app modules | 0 | M1 drop `proxy=` | **yes** (2) | **PASS** |
+| API-08 | Client cannot be redirected by the environment | `trust_env=False` | attacker-controlled proxy | `test_the_client_is_bound_...` | `SUITE` | `trust_env False` | False | — | n/a | **PASS** |
+| API-09 | Redirects are not auto-followed | `follow_redirects=False` | redirect SSRF | same | `SUITE` | False | False | M4 | **yes** | **PASS** |
+| API-10 | Capability is enforced per request | `Proxy-Authorization` → policy | capability crossover | live 11-case sweep | namespace probe | wrong cap denied | denied ×4 | — | n/a | **PASS** |
+| API-11 | Unknown capability gets deny-all | `policy_for_connector` | permissive default | `test_an_unknown_capability_gets_deny_all` | `SUITE` | `deny-all` | `deny-all` | — | n/a | **PASS** |
+| API-12 | No wildcard policy exists | `POLICIES` | global allow | `test_there_is_no_wildcard_policy` | `SUITE` | none contain `*` | none | — | n/a | **PASS** |
+| API-13 | Proxy unreachable ⇒ no client | `_verify_boundary` | silent downgrade | `test_an_unreachable_gateway_fails_closed` | `SUITE` | raises | raises | M7 | **yes** (3) | **PASS** |
+| API-14 | Direct egress success ⇒ raise | `_verify_boundary` | boundary not constraining | `test_direct_egress_success_is_treated_as_a_failure` | `SUITE` | raises | raises | M7 | **yes** | **PASS** |
+| API-15 | API refuses to start without enforcement | `api/app.py` | serving unconstrained | live import | `SUITE` / shell | `RuntimeError` | `RuntimeError` | — | n/a | **PASS** |
+| API-16 | A confined process cannot downgrade | `resolve_mode` | self-selected weaker mode | `test_a_namespaced_process_cannot_downgrade_its_mode` | `SUITE` + live uid 1001 | refused | refused | — | n/a | **PASS** |
+| API-17 | Namespace detection works unprivileged | compare `/var/run/netns/...` | **guard silently disabled** | `test_namespace_detection_works_without_reading_proc1` | `SUITE` | `True` | was `False`, now `True` | revert to `/proc/1` | **yes** | **PASS** |
+| API-18 | Destroy does not strand live processes | `EgressPerimeter.members` | healthy-looking dead service | `test_destroying_the_perimeter_does_not_strand_live_processes` | `SUITE_ROOT` | member detected | detected | — | n/a | **PASS** |
+| API-19 | Stranding warning survives the generic reason | `destroy()` | reassuring-and-wrong | `test_destroy_reports_stranding_when_members_are_left_alone` | `SUITE` | warning text | warning text | — | n/a | **PASS** |
+| API-20 | Authorised reach still works | proxy + policies | enforcement as outage | `test_the_authorised_path_is_still_open` + sweep | `SUITE_ROOT` | 200 | 200 | — | n/a | **PASS** |
+| API-21 | netguard blocks private addresses independently of policy | `netguard` | widened policy reaching internals | `test_a_widened_policy_still_cannot_reach_a_private_address` | `SUITE` | `SSRFBlocked` | blocked | **M6: suite did not fail** | **no** — layer 2 held | **PASS** |
+| **API-22** | **TLS reach to googleapis / openai / telegram** | — | provider integration | live probe | host + namespace | TLS OK | `SSLZeroReturnError` even from the host, no proxy | — | — | **NOT VERIFIED** |
 
 ## B. Cross-process execution lease (mission A — B-02)
 
@@ -113,9 +142,9 @@ Every significant security claim in the v0.2.3 documents maps to one record here
 
 | Metric | Value |
 |---|---|
-| Total | **372 collected** = 341 passed + 31 skipped |
-| Security suite | 271 collected = 240 passed + 31 skipped |
-| Unprivileged pass | 341 |
+| Total | **396 collected** = 359 passed + 37 skipped |
+| Security suite | 295 collected = 258 passed + 37 skipped |
+| Unprivileged pass | 359 |
 | Root, perimeter file only | 17 passed / 2 skipped |
 | Root, full suite | 320 passed / 32 failed / 20 skipped — 32 are the supervisor refusing to run as root (correct behaviour) |
 | Skips | 31 — enumerated below |
@@ -123,10 +152,11 @@ Every significant security claim in the v0.2.3 documents maps to one record here
 | Skip group | Count | Reason | Release implication |
 |---|---|---|---|
 | cgroup enforcement (`tests/security/test_cgroups.py`) | **18** | `/sys/fs/cgroup/skyla` absent: the delegated subtree must be created by `scripts/cgroup_bootstrap.sh` as root once | **The strongest concern on this list.** Memory/pids/CPU limits are asserted in `CGROUPS_VALIDATION.md` from a bootstrapped run, but in a clean checkout these 18 do not execute. A host that never runs the bootstrap has **no cgroup enforcement** while the suite still reports green. Recorded as a bootstrap dependency, and the deployment path must fail closed (see ISO-09) rather than run unlimited. |
-| Perimeter boundary tests, unprivileged run | **12** | `cannot enter namespace 'skyla-egress' without CAP_SYS_ADMIN` | Enforcement is unaffected — the boundary is the route table, not the test. These execute as root (`SUITE_ROOT`: 17 passed / 2 skipped). **NOT VERIFIED in the unprivileged run — not a pass.** |
+| Perimeter boundary tests, unprivileged run | **12** | `cannot enter namespace 'skyla-egress' without CAP_SYS_ADMIN` | Enforcement is unaffected — the boundary is the route table, not the test. These execute as root. **NOT VERIFIED in the unprivileged run — not a pass.** |
+| API egress kernel tests, unprivileged run | **6** | `cannot enter the namespace without CAP_SYS_ADMIN` | Same class. As root the file is 22 passed / 1 skipped; combined with the perimeter file, 45 passed / 1 skipped. **NOT VERIFIED unprivileged.** |
 | `run_confined` absent-namespace path | **1** | perimeter is installed, so the refusal path cannot be reached | Exercised on a host without the perimeter. Low risk; the fail-closed behaviour is also pinned by `test_perimeter_refuses_when_it_cannot_be_built`. |
 
-Total: 31. Enumerated from a live `-rs` run, not estimated.
+Total: 37. Enumerated from a live `-rs` run, not estimated.
 
 No skip is treated as a pass anywhere in this registry.
 
@@ -141,25 +171,36 @@ No skip is treated as a pass anywhere in this registry.
 
 ## I. Registry summary
 
-Counted by parsing every `NET-*`/`LEASE-*`/`ISO-*`/`DB-*`/`CONN-*`/`HOST-*`/`HON-*` row in this document — not estimated.
+Counted by parsing every record row in this document — not estimated.
 
 | Group | Records | PASS | PARTIAL | NOT MET / NOT VERIFIED |
 |---|---|---|---|---|
+| API (API egress integration, `5bace07`) | 22 | 21 | 0 | 1 |
 | NET (perimeter) | 24 | 21 | 2 | 1 |
 | LEASE (B-02) | 12 | 12 | 0 | 0 |
-| ISO (isolation/resources) | 9 | 9 | 0 | 0 |
+| ISO (isolation / resources) | 9 | 9 | 0 | 0 |
 | DB (integrity) | 3 | 3 | 0 | 0 |
 | CONN (connectors) | 5 | 2 | 0 | 3 |
 | HOST (second host) | 2 | 1 | 0 | 1 |
 | HON (honesty controls) | 4 | 4 | 0 | 0 |
-| **Total** | **59** | **52** | **2** | **5** |
+| **Total** | **81** | **73** | **2** | **6** |
 
-Production remains **NO-GO**. Three mandatory controls are not PASS:
+### B-01 status after this milestone
 
-- **NET-23** — no host-wide firewall (environment blocker, §A)
-- **NET-24** — the trusted API process is not yet OS-confined (wiring pending, §A)
-- **HOST-01** — no second host (blocked, §F)
+**REMEDIATED for the API process.** API-01…API-21 pass, including the two records that exist because the implementation was wrong first (API-17 namespace detection unprivileged, API-18 stranding on destroy). API-22 remains NOT VERIFIED for an environment reason, not an implementation one.
 
-Live connectors are NOT VERIFIED (§E: CONN-01/02/03), and independent external review has not taken place. **No skip anywhere in §G is counted as a pass.**
+### Production remains NO-GO
 
-Note on NET: 21 PASS includes 12 boundary tests that execute only as root. In the unprivileged run they are skips, and they are reported as such in §G — the PASS verdict for those records rests on the root run, not on the CI default.
+- **NET-23** — no host-wide default-deny egress. The API is confined; other host processes are not. The netfilter blocker recorded in earlier revisions of this registry was a **PATH artifact** (see `NET-23` note below).
+- **HOST-01** — no second host.
+- **CONN-01/02/03** — no live connector verification.
+- **API-22** — provider data plane unverifiable in this sandbox.
+- Independent external review: not performed.
+
+### Correction to NET-23
+
+Earlier revisions recorded "no `nft`/`iptables` binary, rulesets cannot be loaded". That was wrong, and the error is worth stating rather than quietly editing: `iptables` and `nft` are present in `/usr/sbin`, which is **not on an unprivileged `PATH`**. `sudo iptables -A OUTPUT …` works. `nft` works in the `ip` family; the `inet` family is unsupported here.
+
+The conclusion for NET-23 is unchanged — there is still no host-wide default-deny ruleset — but the reason is now accurate: it is **not deployed**, not **impossible**. That distinction matters because "impossible" closed the item; "not deployed" leaves it as real outstanding work.
+
+**No skip anywhere in §G is counted as a pass.** 12 of the NET PASS records execute only as root; in the unprivileged run they skip and are reported as such.

@@ -6,8 +6,8 @@
 
 Two High findings were pursued to closure: one closed completely, one substantially remediated but not finished. That outcome, stated plainly, is the point of a gate like this: a milestone that reports "all clear" without an external reviewer, without a second host, and without live connectors would be worthless.
 
-- HEAD: **`0a44454`** on `arena/2a497c0e-skyla-prime`
-- Suite: **341 passed, 31 skipped** (372 collected), unprivileged
+- HEAD: **`5bace07`** on `arena/2a497c0e-skyla-prime`
+- Suite: **359 passed, 37 skipped** (396 collected), unprivileged
 - Date: 2026-11-22 · host `e2b.local` · Debian 12 · kernel 6.1.158+
 
 ---
@@ -16,22 +16,22 @@ Two High findings were pursued to closure: one closed completely, one substantia
 
 | # | Mandatory control | v0.2.2 | v0.2.3 |
 |---|---|---|---|
-| 1 | B-01 remediated | FAIL (control absent) | **PARTIAL** — boundary built; trusted-process wiring open |
+| 1 | B-01 remediated | FAIL (control absent) | **PASS** — API process constrained and verified in situ |
 | 2 | B-02 remediated | NOT VERIFIED | **PASS** — closed and mutation-verified |
 | 3 | Independent retest | NOT VERIFIED | **NOT VERIFIED** — no external reviewer |
 | 4 | Separate host | NOT VERIFIED | **NOT VERIFIED** — blocked |
 | 5 | Per-job resource controls | PASS | **PASS** |
 | 6 | Aggregate resource controls | PASS | **PASS** |
 | 7 | Process-tree termination | PASS | **PASS** |
-| 8 | Perimeter enforcement | FAIL | **PARTIAL** — 8/10 properties PASS |
+| 8 | Perimeter enforcement | FAIL | **PASS (9/10)** — 9 properties PASS; host-wide firewall not deployed |
 | 9 | Cross-user boundaries | PASS | **PASS** |
 | 10 | DB integrity + restore | PASS | **PASS** |
 | 11 | Multi-worker idempotency | NOT VERIFIED | **PASS** |
 | 12 | Live connectors | NOT VERIFIED | **NOT VERIFIED** — no credentials |
-| 13 | No open critical/high | FAIL | **FAIL** — 8 open |
+| 13 | No open critical/high | FAIL | **FAIL** — 7 open (B-01 closed) |
 | 14 | Final tree passes suite | PASS | **PASS** |
 
-**7 PASS · 2 PARTIAL · 1 FAIL · 3 NOT VERIFIED** across the 14 controls (row 13 FAIL is the aggregate of open findings; row 1 PARTIAL is B-01 itself).
+**9 PASS · 1 FAIL · 3 NOT VERIFIED** across the 14 controls. B-01 and perimeter enforcement both moved to PASS this milestone.
 
 ## 2. B-02 — closed, and it can be trusted
 
@@ -49,7 +49,11 @@ Result: **30/30 runs, exactly 2 step rows**, at n ∈ {2,3,4,6,8}. Three mutatio
 
 A crucial methodological point: **the verdict is validated by its side effect, never by the API's return value.** An intermediate version returned `held` correctly while still executing the task.
 
-## 3. B-01 — substantially remediated, not finished
+## 3. B-01 — CLOSED at the API boundary (superseded by the integration milestone)
+
+> **Update (commit `5bace07`).** The gap in this section is closed. The API process now runs inside the perimeter, all 11 outbound call sites go through one factory, and the constraint was proven from the live unprivileged process. See `B01_API_EGRESS_INTEGRATION.md`. The original analysis is retained below because it documents why the earlier closure was insufficient.
+
+### Historical position
 
 The finding was not taken at face value. Probing first produced a scope correction: **untrusted-execution workloads were never exposed** — `unshare -n` plus a seccomp filter denying `socket()` means every connect returns `PermissionError` and `/proc/net/dev` shows no interfaces. B-01 is about the **trusted API process**, which has full host networking and, in v0.2.2, no enforcement at all (`grep -c "egress\|proxy" skyla/api/app.py` → **0**).
 
@@ -65,8 +69,8 @@ Two mutations prove the layers are independent: adding a route to the host link 
 
 | Finding | Status | Blocker |
 |---|---|---|
-| **NET-23** — host-wide nftables ruleset | NOT MET | No `nft`/`iptables` binary; no installable binding; direct `libnftables.so.1` netlink write returns `Could not process rule: No such file or directory` as uid 0, `CapEff 1ffffffffff`, inside a fresh netns. Environment boundary. |
-| **NET-24** — API process OS-confined | PARTIAL | `run_confined()` proven but unused by `api/app.py`; proxy starts only when explicitly enabled |
+| **NET-23** — host-wide nftables ruleset | **NOT DEPLOYED** (corrected) | Earlier text called this impossible. It is not: `iptables`/`nft` live in `/usr/sbin`, absent only from the unprivileged `PATH`; `sudo iptables -A OUTPUT …` applies. The control is outstanding work, not blocked work. |
+| **NET-24** — API process OS-confined | **CLOSED** (`5bace07`) | was PARTIAL; now confined and verified in situ |
 | **HOST-01** — separate host | NOT VERIFIED | No hypervisor, no container runtime, apt egress blocked; and a container on this kernel would not satisfy the gate anyway |
 | **CONN-01/02/03** — live connectors | NOT VERIFIED | Zero provider credentials; provider endpoints *are* reachable, so this is authorization, not network |
 | **Independent review** | NOT VERIFIED | No qualified external reviewer |
