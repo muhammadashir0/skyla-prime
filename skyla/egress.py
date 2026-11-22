@@ -400,13 +400,35 @@ class EgressProxy:
 
 
 def proxy_from_env() -> EgressProxy | None:
-    """Build a proxy from SKYLA_EGRESS_* env if configured."""
+    """Build a proxy from SKYLA_EGRESS_* env if configured.
+
+    Under the v0.2.3 perimeter (`skyla.perimeter`) the workload namespace can
+    reach exactly one address: `10.200.0.1`, the gateway, which DNATs one port to
+    this proxy. So the proxy must be bound to the **host side of the gateway veth**
+    (`10.201.0.1`), not to loopback and not to `0.0.0.0`:
+
+      * bound to loopback, the workload cannot reach it at all;
+      * bound to `0.0.0.0`, every other process on this host — and anything that can
+        route to the host — can use this proxy as an open relay, which is the
+        uncontrolled egress path B-01 is about.
+
+    `SKYLA_EGRESS_BIND` selects the address; it defaults to loopback so behaviour
+    is unchanged when no perimeter is installed.
+    """
     policy_name = os.getenv("SKYLA_EGRESS_POLICY", "")
     enabled = os.getenv("SKYLA_EGRESS_ENABLED", "0") == "1"
     if not (enabled or policy_name):
         return None
     policy = POLICIES.get(policy_name, POLICIES["deny-all"])
-    return EgressProxy(port=int(os.getenv("SKYLA_EGRESS_PORT", "0")), policy=policy)
+    bind = os.getenv("SKYLA_EGRESS_BIND", "127.0.0.1")
+    if bind == "0.0.0.0":
+        # Refuse rather than warn: an open relay is the finding, not a preference.
+        raise EgressDenied(
+            "refusing to bind the egress proxy to 0.0.0.0 — that makes it an open "
+            "relay for every process on the host; bind the perimeter's host-side "
+            "gateway address (10.201.0.1) or loopback", destination=bind)
+    return EgressProxy(host=bind, port=int(os.getenv("SKYLA_EGRESS_PORT", "0")),
+                       policy=policy)
 
 
 # Singleton, started on demand by the API when enabled.

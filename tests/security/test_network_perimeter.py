@@ -376,3 +376,49 @@ def test_verify_reports_available_false_with_a_reason_when_broken(monkeypatch):
     st = p.verify()
     assert st.available is False
     assert "default route" in st.reason, f"unhelpful reason: {st.reason!r}"
+
+
+# --------------------------------------- the proxy is bound where it must be
+def test_proxy_refuses_to_bind_all_interfaces(monkeypatch):
+    """Binding 0.0.0.0 would make the proxy an open relay — the B-01 finding."""
+    from skyla.egress import EgressDenied, proxy_from_env
+    monkeypatch.setenv("SKYLA_EGRESS_ENABLED", "1")
+    monkeypatch.setenv("SKYLA_EGRESS_BIND", "0.0.0.0")
+    with pytest.raises(EgressDenied) as exc:
+        proxy_from_env()
+    assert "open relay" in str(exc.value)
+
+
+def test_proxy_binds_the_configured_gateway_address(monkeypatch):
+    """Under the perimeter it must bind the host side of the gateway veth."""
+    import skyla.egress as E
+    seen = {}
+
+    class Fake(E.EgressProxy):
+        def __init__(self, host="127.0.0.1", port=0, policy=None, **kw):
+            seen["host"], seen["port"] = host, port
+            self.host, self.port = host, port
+
+    monkeypatch.setattr(E, "EgressProxy", Fake)
+    monkeypatch.setenv("SKYLA_EGRESS_ENABLED", "1")
+    monkeypatch.setenv("SKYLA_EGRESS_BIND", "10.201.0.1")
+    monkeypatch.setenv("SKYLA_EGRESS_PORT", "8155")
+    E.proxy_from_env()
+    assert seen["host"] == "10.201.0.1", "proxy bound somewhere the workload cannot reach"
+    assert seen["port"] == 8155
+
+
+def test_proxy_defaults_to_loopback_when_no_perimeter_is_installed(monkeypatch):
+    """Existing behaviour is unchanged where no namespace exists."""
+    import skyla.egress as E
+    seen = {}
+
+    class Fake(E.EgressProxy):
+        def __init__(self, host="127.0.0.1", port=0, policy=None, **kw):
+            seen["host"] = host
+
+    monkeypatch.setattr(E, "EgressProxy", Fake)
+    monkeypatch.setenv("SKYLA_EGRESS_ENABLED", "1")
+    monkeypatch.delenv("SKYLA_EGRESS_BIND", raising=False)
+    E.proxy_from_env()
+    assert seen["host"] == "127.0.0.1"

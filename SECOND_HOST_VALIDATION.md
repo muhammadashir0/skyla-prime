@@ -1,142 +1,75 @@
-# SECOND HOST VALIDATION — v0.2.2 PRIME QUALIFICATION
+# Second-Host Validation — v0.2.3 Mission C
 
-**Mission 1.** Establish an independent Linux staging environment and reproduce the
-execution-isolation suite there.
+**Verdict: NOT VERIFIED. No second host could be obtained, and the reason is an environment boundary rather than an omission.**
 
-## Verdict
-
-> ## **NOT VERIFIED**
->
-> **No second host was available.** The programme ran on the same machine for every
-> mission, so nothing in this release is evidence of portability. This document
-> records the host profile in full, states exactly which validation was performed
-> and which was not, and specifies what a second host must reproduce.
-
-This is the single largest gap in the qualification. It is not downgraded to PASS
-because the same suite was green twice: running the same tests on the same kernel
-with the same LSM stack is repetition, not independence.
+A requirement that cannot be satisfied must be reported with its exact blocker and kept NOT VERIFIED. It must never be substituted with another process, container, or virtualenv on this host — that is explicitly not what this gate asks for.
 
 ---
 
-## 1. Host profile (measured, `2026-11-22`)
+## 1. What the gate requires
 
-| Property | Value | How measured |
+> Isolation verified on a genuinely separate Linux staging host: clean clone, native components built from source, full security suite executed, and the OS/kernel/CPU/memory/cgroup v2/delegated controllers/namespaces/Landlock ABI/seccomp/runtime/network/filesystem permissions/build dependencies documented.
+
+## 2. Why it could not be done on this host
+
+Every available mechanism for creating a separate host was checked. None exists.
+
+| Mechanism | Result | Evidence |
 |---|---|---|
-| Hostname | `e2b.local` | `hostname` |
-| Machine ID | `7d67db294736411fab4adf8d1898c585` | `/etc/machine-id` |
-| Distribution | Debian GNU/Linux 12 (bookworm) | `/etc/os-release` |
-| Kernel | `6.1.158+ #1 SMP PREEMPT_DYNAMIC x86_64` | `uname -a` |
-| CPU | 2 × Intel Xeon @ 2.60 GHz | `nproc`, `/proc/cpuinfo` |
-| Memory | 3939 MB total, ~3648 MB available | `free -m` |
-| Privilege | uid 1001 `user`; passwordless `sudo` to root | `id`, `sudo -n -l` |
-| Seccomp (test process) | `Seccomp: 0` at rest; sandbox workloads get mode 2 | `/proc/self/status` |
-| seccomp actions available | `kill_process kill_thread trap errno user_notif trace log allow` | `/proc/sys/kernel/seccomp/actions_avail` |
+| Dedicated hypervisor (`qemu-system-x86_64`, `qemu-kvm`) | **absent** | `command -v` → not found |
+| MicroVM (`firecracker`, `cloud-hypervisor`) | **absent** | `command -v` → not found |
+| Container runtime (`docker`, `podman`, `nerdctl`) | **absent** | `command -v` → not found |
+| System container (`systemd-nspawn`, `lxc`) | **absent** | `command -v` → not found |
+| Install any of the above | **blocked** | `apt-get update` → `Connection failed [IP: 151.101.130.132 80]` for `deb.debian.org`; `apt-get install qemu-system-x86` → `Unable to locate package` |
 
-### Namespaces
+The sandbox permits egress to **github.com, codeload.github.com, api.github.com, registry.npmjs.org, pypi.org, files.pythonhosted.org** only. Debian package mirrors are unreachable, so no hypervisor or container runtime can be fetched and installed. There is no cloud API credential or provider CLI in the environment to provision a remote host.
 
-All requested namespaces exist (`/proc/self/ns/`):
-`user`, `pid`, `mnt`, `net`, `uts`, `ipc`, `cgroup`, `time`.
+**And even if one of those runtimes were installed, it would not satisfy the gate.** The requirement is explicit that another process, container, or virtualenv on the original host does not count. A container shares this kernel — kernel 6.1.158+, this cgroup hierarchy, this Landlock ABI, this seccomp behaviour. The gate exists precisely to find the failures that a shared kernel hides: a different kernel's Landlock ABI, a host without cgroup v2, a distro whose `unshare` lacks a flag.
 
-Behaviour differs by privilege and this matters for the v0.3.0 supervisor:
+## 3. What *was* verified on this host
 
-| Operation | As uid 1001 | As root |
-|---|---|---|
-| `unshare -m` | **EPERM** | OK |
-| `unshare -Urmpf -n` (supervisor form) | OK (uses userns to gain mount rights) | OK |
-
-### Landlock
+The environment is recorded in full so a second host can be compared against it field by field. This is documentation, **not** a substitute for HOST-01.
 
 | Property | Value |
 |---|---|
-| ABI | **2** |
-| Enforcing LSM | `capability,landlock,selinux` (`/sys/kernel/security/lsm`) |
-| Write-confinement | verified by `tests/security/test_host_containment.py` |
+| Hostname | `e2b.local` |
+| OS | Debian GNU/Linux 12 (bookworm) |
+| Kernel | **6.1.158+** |
+| CPU | 2 vCPU |
+| Memory | 3939 MB |
+| cgroup | **v2** (`cgroup2fs` at `/sys/fs/cgroup`) |
+| Available controllers | `cpuset cpu io memory hugetlb pids` |
+| Delegated subtree control | `cpuset cpu io memory pids` |
+| Namespaces | `unshare` util-linux 2.38.1; user/net/pid/mount/uts/ipc usable |
+| Landlock | **ABI 2** (`landlock_create_ruleset(NULL,0,1) == 2`) |
+| seccomp | `CONFIG_SECCOMP=y` |
+| Landlock in kernel | `CONFIG_SECURITY_LANDLOCK=y` |
+| Runtime | Python 3.11.2, uvicorn 0.54.0, FastAPI 0.165.0 |
+| SQLite | 3.40.1 |
+| git | 2.39.5 |
+| Root filesystem type | `ext2/ext3` |
+| Service uid | 1001 (unprivileged), NOPASSWD sudo for the operator |
+| umask | 0022 |
 
-### cgroups v2
+### Host-specific blockers documented during this milestone
 
-| Property | Value |
-|---|---|
-| Filesystem | `cgroup2fs` (magic `0x63677270`) |
-| Root controllers | `cpuset cpu io memory hugetlb pids` |
-| Root `subtree_control` | `cpuset cpu io memory pids` |
-| Delegated subtree | `/sys/fs/cgroup/skyla` → owned by uid 1001 |
-| Controllers delegated | `cpu memory pids` |
-| Not delegated | `io cpuset` (not required by this release) |
-| `cgroup.kill` | present (kernel ≥ 5.14) |
+These are properties of *this* host that a second host would very likely not share, and they are the strongest argument for why HOST-01 still matters:
 
-Delegation required one privileged step (`scripts/cgroup_bootstrap.sh`). Afterwards,
-creating cgroups and writing `memory.max`, `pids.max`, `cpu.max`, `cgroup.kill` all
-worked as uid 1001 with **no** runtime privilege.
+1. **Netfilter rulesets cannot be loaded.** `nft` and `iptables` binaries are absent, no binding is installable, and a direct `libnftables.so.1` netlink write returns `Could not process rule: No such file or directory` **as uid 0 with `CapEff 000001ffffffffff` and inside a freshly created network namespace**. On an ordinary Debian host this would succeed, and the perimeter could add a host-firewall layer that is not available here.
+2. **The full test suite must run unprivileged.** As root, the supervisor refuses to execute untrusted jobs (`refusing to run: supervisor must not be setuid/root`) — 32 tests fail by design. A second host would confirm this is a property of the code, not of this uid.
+3. **cgroup enforcement requires a one-time root bootstrap** (`scripts/cgroup_bootstrap.sh`). Without it 18 tests skip. `CGROUPS_VALIDATION.md` records results from a bootstrapped run; a clean second host would show whether the bootstrap is genuinely reproducible or depended on this host's pre-existing delegation.
 
-### Container runtimes
+## 4. What is needed to close this gate
 
-| Runtime | Status |
-|---|---|
-| docker, podman, runc, crun, bwrap, runsc (gVisor), firecracker, systemd-nspawn, lxc | **all absent** |
+1. A Linux host that is **not** this machine — a VM or physical box is acceptable; a container on this kernel is not.
+2. A **clean clone** of commit `ad53336` (or later), with `pip install -e ".[dev]"` into a fresh virtualenv, so no artefact of this host's build leaks in.
+3. Native components built **from source** on that host.
+4. `scripts/cgroup_bootstrap.sh` as root, then the full suite **unprivileged**, plus the perimeter file **as root**.
+5. The table in §3 filled in from that host, with every divergence explained.
+6. Results attached here with the host's `uname -a`, `id`, and the suite's raw output.
 
-Package installation is impossible: outbound HTTP (port 80) to `deb.debian.org`
-fails, so `qemu-system-x86` and `cgroup-tools` cannot be fetched. HTTPS egress is
-restricted by the sandbox to a small allowlist (pypi.org, github.com, npm),
-confirmed by direct `curl` (see `EGRESS_PROXY_ASSESSMENT.md` §5).
+## 5. Verdict
 
-**Consequence:** a true separate host could not be provisioned, and neither a VM
-tier (Firecracker/QEMU) nor a user-space kernel (gVisor) could be installed. The
-"prefer a host with rootless container support" instruction is unsatisfiable here.
+**HOST-01: NOT VERIFIED.** Not attempted-and-failed for lack of effort — attempted and blocked at the environment boundary, with the exact blocker recorded above. No substitute was used and none may be.
 
-### Filesystem permissions
-
-```
-drwxr-xr-x user:user  /sys/fs/cgroup/skyla
-drwxr-xr-x user:user  /sys/fs/cgroup/skyla/service
-```
-
-Database files are created `0600` inside a `0700` directory by
-`skyla/db.py::_secure_db_dir` (asserted by
-`tests/security/test_db_integrity.py::test_database_file_is_created_0600`).
-
----
-
-## 2. What was reproduced here
-
-| Suite | Tests | Result |
-|---|---|---|
-| `tests/security/test_host_containment.py` | 20 | **PASS** (live kernel) |
-| `tests/security/test_mutation_harness.py` | 13 | **PASS** (13/13 mutations detected) |
-| `tests/security/test_cgroups.py` | 18 | **PASS** when run inside the delegated subtree (stable over 10 consecutive runs) |
-| `tests/security/test_cgroup_failclosed.py` | 15 | **PASS** anywhere (no kernel privileges needed) |
-| `tests/security/test_egress.py` | 22 | **PASS** |
-| `tests/security/test_backup.py` | 13 | **PASS** |
-| `tests/security/test_multiworker.py` | 9 | **PASS** |
-| `tests/security/test_connector_reliability.py` | 16 | **PASS** |
-| Full suite | 307 passed, 16 skipped | **PASS** |
-
-The 16 skips are the cgroup tests when invoked outside the delegated subtree. A
-skip is recorded as `NOT VERIFIED`, never as a pass — that distinction is load
-bearing, because it is exactly the failure mode a second host would expose.
-
-## 3. What a second host must reproduce
-
-Run on a machine with a different kernel, LSM stack and container runtime:
-
-1. `scripts/cgroup_bootstrap.sh` as root, then `scripts/skyla-run.sh`.
-2. `pytest tests/security -q` — all modules, **no skips**.
-3. Confirm `containment_status()` reports `landlock_abi > 0`, `seccomp: true`.
-4. Confirm `cgroup_governor.status()` reports `cgroup_v2: true, placement: true`.
-5. Confirm a memory bomb is OOM-killed by the kernel (`rc=-9`, `oom_kills>=1`) and
-   a double-forked grandchild does not survive `cgroup.kill`.
-6. Confirm the host's own egress policy, and that the proxy denies non-allowlisted
-   hosts before any TCP connect.
-7. Re-run `tests/security/test_mutation_harness.py` — the mutants are rebuilt from
-   source, so this proves the controls are load-bearing on *that* kernel too.
-
-**Nothing above has been done on a second host.** Status: **NOT VERIFIED**.
-
-## 4. Why this blocks release
-
-Release criterion 1 requires host isolation to be *independently verified*. A
-single host cannot independently verify itself: kernel version, LSM ordering,
-`/proc` layout and cgroup delegation semantics are all environment-specific, and
-this release changed behaviour based on exactly those properties (e.g. the
-supervisor relies on Landlock-ABI-2 semantics and on cgroup v2 ancestor-write
-rules). Until a second host runs this suite with zero skips, the strongest
-defensible statement is: *contained execution is verified on this host profile.*
+Release implication: this is one of the mandatory production controls. Production stays **NO-GO** on it until a genuinely separate host runs the suite.

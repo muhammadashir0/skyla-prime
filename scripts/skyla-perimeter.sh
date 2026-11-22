@@ -9,6 +9,8 @@
 #   scripts/skyla-perimeter.sh verify    verify only (non-destructive)
 #   scripts/skyla-perimeter.sh status    show current state
 #   scripts/skyla-perimeter.sh destroy   remove
+#   scripts/skyla-perimeter.sh proxy     run the egress proxy where the workload
+#                                        dials it (foreground; needs the perimeter)
 #
 # The boundary is the routing table, not a filter: the namespace has one /30
 # interface, a route to the proxy host and NO default route. A packet to any other
@@ -21,7 +23,7 @@ PROXY_PORT="${SKYLA_EGRESS_PORT:-8155}"
 PY="${PYTHON:-python3}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 [ $# -ge 1 ] || usage
 
 case "$1" in
@@ -79,6 +81,28 @@ status)
         || echo "namespace '$NS': absent"
     ip netns exec "$NS" ip route 2>/dev/null || true
     ip netns exec "$NS" ip -brief addr 2>/dev/null || true
+    ;;
+proxy)
+    # The workload can reach exactly one address — the gateway — and the gateway
+    # DNATs one port to the host. So the proxy must listen on the HOST side of the
+    # gateway veth. Started anywhere else it is unreachable from inside, which is
+    # what an earlier version of this script did (broke the allow path silently).
+    exec "$PY" - "$ROOT" "$PROXY_PORT" <<'EOF'
+import os, sys, time
+root, port = sys.argv[1], int(sys.argv[2])
+sys.path.insert(0, root)
+from skyla.egress import EgressProxy, POLICIES
+os.environ["SKYLA_EGRESS_BIND"] = "10.201.0.1"
+policy = POLICIES[os.getenv("SKYLA_EGRESS_POLICY", "research")]
+p = EgressProxy(host="10.201.0.1", port=port, policy=policy).start()
+print(f"egress proxy on {p.host}:{p.port} policy={policy.name} "
+      f"(reachable from the workload as 10.200.0.1:{port})", flush=True)
+try:
+    while True:
+        time.sleep(3600)
+except KeyboardInterrupt:
+    p.stop()
+EOF
     ;;
 destroy)
     ip netns del "$NS" 2>/dev/null && echo "namespace '$NS' removed" || echo "namespace '$NS' already absent"
