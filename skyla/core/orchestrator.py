@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 from ..agents.registry import get_agent
 from ..db import Database
@@ -20,9 +21,13 @@ from .planner import plan_task
 
 
 class Orchestrator:
-    def __init__(self, db: Database, router: ModelRouter | None = None):
+    def __init__(self, db: Database, router: ModelRouter | None = None,
+                 holder: str | None = None):
         self.db = db
         self.router = router or ModelRouter()
+        # Unique per process, so a lease identifies WHO is executing. Default is
+        # pid+start-time: two processes can never share a pid simultaneously.
+        self.holder = holder or f"pid{os.getpid()}"
 
     async def run_task(self, task_id: str) -> dict:
         task = self.db.get_task(task_id)
@@ -30,7 +35,32 @@ class Orchestrator:
             raise ValueError(f"Task {task_id} not found")
         if task["status"] in ("completed", "failed"):
             return task
+        # 'interrupted' means a holder died mid-run (see Database.reap_expired_tasks).
+        # Re-running it would duplicate work and external actions; that needs an
+        # explicit decision, not a silent retry.
+        if task["status"] == "interrupted":
+            self.db.audit("orchestrator", "task.skipped.interrupted", task_id)
+            return task
 
+        # B-02: claim execution atomically BEFORE doing anything with side effects.
+        # This replaces check-then-act on `status`, which let N processes each run
+        # the whole plan (measured at N=2,3,4: task_steps grew N x 2).
+        claim = self.db.lease_task(task_id, self.holder)
+        if claim["status"] != "acquired":
+            # Someone else owns it. Do not wait, do not work, do not fail the task.
+            self.db.audit("orchestrator", f"task.lease.{claim['status']}",
+                          f"{task_id} holder={claim['lease'].get('holder', '?')}")
+            return self.db.get_task(task_id) or task
+
+        try:
+            return await self._run_claimed(task_id, task)
+        finally:
+            # Release on every path, including exceptions and cancellation, so a
+            # live-but-finished task is immediately claimable rather than waiting
+            # for the TTL.
+            self.db.release_task(task_id, self.holder)
+
+    async def _run_claimed(self, task_id: str, task: dict) -> dict:
         self.db.update_task(task_id, status="planning")
         plan = plan_task(task["instruction"])
         plan_dict = {"kind": plan.kind, "summary": plan.summary,

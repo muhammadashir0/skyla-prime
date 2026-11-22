@@ -134,6 +134,27 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
     applied_at REAL NOT NULL
 );
+-- v0.2.3 (B-02): cross-process execution lease. `task_id` is the PRIMARY KEY so
+-- the kernel of record (SQLite) allows exactly one live lease per task, whatever
+-- the number of API workers.
+CREATE TABLE IF NOT EXISTS task_leases (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_task_leases_expires ON task_leases(expires_at);
+-- Recovery of tasks abandoned by a dead lease holder. 'executing' must be
+-- distinguishable from 'queued' (never started) and 'interrupted' (started, no
+-- holder) so a crashed task is visible rather than silently re-run.
+CREATE TABLE IF NOT EXISTS task_recovery (
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    recovered_at REAL NOT NULL,
+    previous_status TEXT NOT NULL,
+    previous_holder TEXT,
+    reason TEXT NOT NULL,
+    PRIMARY KEY (task_id, recovered_at)
+);
 """
 
 # Ordered, versioned migrations (WS5). Each is idempotent (IF NOT EXISTS /
@@ -410,6 +431,123 @@ class Database:
         tenant = self._require_tenant(owner_id)
         return [dict(r) for r in self.query(
             "SELECT * FROM memories WHERE owner_id=? ORDER BY created_at", (tenant,))]
+
+    # -- execution leases (v0.2.3, closes B-02) -------------------------
+    def lease_task(self, task_id: str, holder: str, ttl_s: float = 900.0) -> dict:
+        """Atomically claim the right to EXECUTE a task. Returns {status, lease}.
+
+        B-02: `Orchestrator.run_task()` used to do
+            if task["status"] in ("completed","failed"): return task
+            db.update_task(status="planning")
+        which is check-then-act. Two workers (or two processes, or two scheduler
+        ticks) could both read "queued" and both run the whole plan — measured at
+        2, 3 and 4 concurrent processes: every one of them executed the task, and
+        `task_steps` grew linearly (n x 2 steps) where it should stay at 2. Because
+        every step calls an agent, that is duplicate model spend and duplicate
+        external actions.
+
+        The claim is one INSERT into `task_leases`, whose PRIMARY KEY is `task_id`.
+        SQLite serialises writers, so exactly one INSERT succeeds and there is no
+        window between the check and the claim. An EXPIRED lease may be taken over,
+        so a crashed holder cannot wedge a task forever.
+
+        status is one of:
+          acquired  - this caller owns execution; run the task
+          held      - another live holder owns it; do NOT run, do not wait
+          terminal  - the task already finished; replay its record
+        """
+        now = time.time()
+        expires = now + ttl_s
+
+        # The claim is a COMPARE-AND-SWAP on the task's own status, executed as a
+        # single UPDATE. Ownership therefore cannot be re-acquired after the winner
+        # finishes: once the task is 'completed'/'failed' the WHERE no longer
+        # matches, whatever any worker read earlier.
+        #
+        # An earlier version of this fix claimed a row in `task_leases` instead and
+        # DELETEd it on completion. That was still wrong, and measurement caught it:
+        # a worker that had already read status='queued' could arrive after the
+        # winner released the row, see no lease, acquire, and re-run the task. The
+        # defect moved from "concurrent duplicate" to "sequential duplicate", which
+        # is just as expensive. CAS on `tasks.status` closes both.
+        # ONLY 'queued' is claimable. 'planning' and 'running' mean a live holder
+        # is mid-run — the first version of this fix allowed 'planning' and
+        # measurement caught the consequence: a late worker re-acquired a task
+        # whose holder had already moved it to 'planning', producing 4 step rows
+        # at n=4 in 2 of 8 runs.
+        claimed = self.execute(
+            "UPDATE tasks SET status='executing', updated_at=? "
+            " WHERE id=? AND status='queued'",
+            (now, task_id))
+        if claimed.rowcount != 1:
+            task = self.query_one("SELECT status FROM tasks WHERE id=?", (task_id,))
+            status = task["status"] if task else "missing"
+            if status in ("completed", "failed", "interrupted"):
+                return {"status": "terminal", "lease": {"task_status": status}}
+            return {"status": "held", "lease": {"task_status": status}}
+
+        # Ownership is now ours. Record the holder/expiry for crash recovery. A row
+        # may survive here if a previous holder died without releasing; it is
+        # overwritten because we have already won the status CAS.
+        self.execute(
+            "INSERT INTO task_leases (task_id, holder, acquired_at, expires_at)"
+            " VALUES (?,?,?,?)"
+            " ON CONFLICT(task_id) DO UPDATE SET holder=excluded.holder,"
+            " acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
+            (task_id, holder, now, expires))
+        return {"status": "acquired",
+                "lease": {"task_id": task_id, "holder": holder,
+                          "acquired_at": now, "expires_at": expires}}
+
+    def release_task(self, task_id: str, holder: str) -> bool:
+        """Drop our lease row, without touching the task status.
+
+        Scoped by holder so we cannot release someone else's lease. Note that the
+        row is only crash-recovery metadata: execution exclusion comes from the
+        status CAS in `lease_task`, so deleting this row does NOT make the task
+        claimable again.
+        """
+        cur = self.execute(
+            "DELETE FROM task_leases WHERE task_id=? AND holder=?", (task_id, holder))
+        return cur.rowcount > 0
+
+    def lease_holder(self, task_id: str) -> str | None:
+        row = self.query_one("SELECT holder FROM task_leases WHERE task_id=?", (task_id,))
+        return row["holder"] if row else None
+
+    def reap_expired_tasks(self, now: float | None = None) -> list[dict]:
+        """Recover tasks whose holder died. Returns what was recovered.
+
+        A dead worker leaves an `executing` task with a stale lease. Silently
+        re-running it would duplicate every agent call and every external action —
+        the very defect this lease exists to prevent — so the task is parked in
+        `interrupted` and recorded, and recovery is an explicit decision by an
+        operator or a retry endpoint (A-17 is still open: there is no resume).
+        """
+        now = time.time() if now is None else now
+        stale = [dict(r) for r in self.query(
+            "SELECT l.task_id, l.holder, l.expires_at, t.status FROM task_leases l"
+            "  JOIN tasks t ON t.id = l.task_id"
+            " WHERE l.expires_at <= ?", (now,))]
+        recovered = []
+        for row in stale:
+            if row["status"] in ("completed", "failed", "interrupted"):
+                # Nothing to recover; the lease is simply leftover.
+                self.execute("DELETE FROM task_leases WHERE task_id=?", (row["task_id"],))
+                continue
+            self.execute("DELETE FROM task_leases WHERE task_id=?", (row["task_id"],))
+            self.execute(
+                "UPDATE tasks SET status='interrupted', updated_at=? WHERE id=?",
+                (now, row["task_id"]))
+            self.execute(
+                "INSERT OR REPLACE INTO task_recovery"
+                " (task_id, recovered_at, previous_status, previous_holder, reason)"
+                " VALUES (?,?,?,?,?)",
+                (row["task_id"], now, row["status"], row["holder"], "lease expired"))
+            self.audit("lease_reaper", "task.interrupted",
+                       f"{row['task_id']} holder={row['holder']} status={row['status']}")
+            recovered.append(row)
+        return recovered
 
     # -- idempotency ledger (WS3) --------------------------------------
     def ledger_begin(self, key: str, fingerprint: str, connector: str, operation: str) -> dict:
