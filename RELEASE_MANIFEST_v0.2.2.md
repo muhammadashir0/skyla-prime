@@ -4,29 +4,41 @@
 **Date:** 2026-11-22
 **Branch:** `arena/2a497c0e-skyla-prime`
 **Base:** `cb4cfce` (`main`)
-**Release commits:** `872647b` (M2/M3/M4) · `381795e` (M5) · `0356454` (cgroup wiring + M6)
+**Release commits:** `872647b` (M2/M3/M4) · `381795e` (M5) · `0356454` (cgroup wiring
++ M6) · `278eb73` (M8 docs) · `3ab461d` (fail-closed cgroups, B-08) · `f669668`
+(reproduction corrections)
 **Decision:** **NO-GO for production. GO for a dedicated staging environment, with
 the conditions in §6.**
 
 > Three of the ten release-gate items cannot be satisfied in this environment and are
 > recorded as **NOT VERIFIED**, not as passes: second-host isolation, live connector
-> behaviour, and independent external review. One High finding (B-01, egress
-> perimeter) and one High finding (B-02, cross-worker scheduler lease) remain open.
-> No finding was downgraded to reach this verdict.
+> behaviour, and independent external review. A fourth (egress) fails as a perimeter.
+> Two High findings (B-01 egress perimeter, B-02 cross-worker scheduler lease) remain
+> open. No finding was downgraded to reach this verdict.
+>
+> Two High defects were found **during** documentation and fixed before this
+> manifest was written: **B-08** (the cgroup governor failed open — limits were
+> written without checking, and the API was told enforcement was enabled) and a
+> **reproduction-script error** that would have reported a false PASS on the
+> idempotency gate. Both are recorded with the regression test that now catches
+> them. The release is stronger for having found them, and the fact that both were
+> invisible to the existing green suite is itself the finding.
 
 ---
 
 ## 1. What is in this release
 
-### Code (3 commits, 15 files, 2 798 insertions / 20 deletions since `41614fc`)
+### Code (24 files, 4 818 insertions / 20 deletions since `41614fc`)
 
 | Area | Files | What changed |
 |---|---|---|
-| OS resource governance (M2) | `skyla/execution/cgroups.py` (new, 465) · `scripts/cgroup_bootstrap.sh` · `scripts/skyla-run.sh` · `providers.py` · `workload.py` | cgroup v2 per-job and aggregate limits; kernel—not application—enforcement; workload self-placement; `cgroup.kill` termination |
+| OS resource governance (M2) | `skyla/execution/cgroups.py` (new, 492) · `scripts/cgroup_bootstrap.sh` · `scripts/skyla-run.sh` · `providers.py` · `workload.py` | cgroup v2 per-job and aggregate limits; kernel—not application—enforcement; workload self-placement; `cgroup.kill` termination |
 | Network egress (M3) | `skyla/egress.py` (new, 414) | default-deny forward proxy; allowlist before DNS; dial the vetted IP; JSONL audit |
 | DB backup (M4) | `skyla/backup.py` (new, 329) | SQLite online backup, verification, atomic publication, guarded restore |
 | Multi-worker (M5) | `skyla/db.py` · `skyla/api/app.py` | atomic `ledger_begin`, `in_flight`/`duplicate`/`conflict` semantics, `ledger_reap_stale`, `is not None` replay checks |
 | Connector tests (M6) | `tests/security/test_connector_reliability.py` | 16 tests asserting mock/live separation and provider-error propagation |
+| **Fail-closed cgroups (B-08)** | `skyla/execution/cgroups.py` · `tests/security/test_cgroup_failclosed.py` (new, 15) | every limit write is checked; a failed limit refuses the workload instead of running it unbounded. Found by review, not by the suite — `test_cgroups.py` skips without privileges, so the fail-open path was never exercised |
+| Backup test hardening | `tests/security/test_backup.py` | 16 tests; naive-copy and torn-pair defects reproduced deterministically, plus a mutation-verified WAL-only case |
 
 ### Qualification documents (8, as specified)
 

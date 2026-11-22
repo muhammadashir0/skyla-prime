@@ -164,12 +164,13 @@ double-forked grandchild (escapes process-group kill), cgroup.kill = 1
 as a second line. Both run, and the result is ANDed:
 `termination: "cgroup-kill+pid-namespace"`.
 
-## 6. Integration with the execution path — four bugs found by measuring
+## 6. Integration with the execution path — five defects
 
 Enforcement existing in a module is not enforcement in the product. Wiring the
 governor into `NamespaceProvider.run()` exposed four defects that all read as
-"working" until the kernel counters were inspected. The fourth was found later, by
-reviewing the limit-write path rather than the tests:
+"working" until the kernel counters were inspected; a fifth was found later by
+reviewing the limit-write path rather than the tests. One of the five was in the
+*test harness*, not the product — which is its own lesson (§6, item 4).
 
 0. **Every limit write was optional.** `create_job()` and `ensure_aggregate()` called
    `_write(...)` for `memory.max`, `memory.swap.max`, `memory.oom.group`, `pids.max`,
@@ -189,14 +190,6 @@ reviewing the limit-write path rather than the tests:
    the unfixed code** and passes 15/15 against the fix. Note that
    `test_cgroups.py` cannot catch this: it skips entirely unless cgroups are
    delegated, so the fail-open path is invisible to it.
-1. **The workload was never in the cgroup.** Attaching the `Popen` pid placed only
-   the `unshare` parent there; `unshare(1)` forks, so children stayed outside
-   (`pids_peak = 0`, `memory_peak_mb = 0.0`). An 800 MB allocation succeeded and a
-   fork storm was unbounded *while the API reported `cgroup.enabled = true`*.
-   Fixed by having the final process place **itself** in the job cgroup, verified
-   to move parent and child together (`pids_peak = 2`) — whereas attaching the
-   outer pid did not.
-
 1. **The workload was never in the cgroup.** Attaching the `Popen` pid placed only
    the `unshare` parent there; `unshare(1)` forks, so children stayed outside
    (`pids_peak = 0`, `memory_peak_mb = 0.0`). An 800 MB allocation succeeded and a
