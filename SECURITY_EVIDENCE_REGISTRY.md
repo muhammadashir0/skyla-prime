@@ -204,3 +204,134 @@ Earlier revisions recorded "no `nft`/`iptables` binary, rulesets cannot be loade
 The conclusion for NET-23 is unchanged — there is still no host-wide default-deny ruleset — but the reason is now accurate: it is **not deployed**, not **impossible**. That distinction matters because "impossible" closed the item; "not deployed" leaves it as real outstanding work.
 
 **No skip anywhere in §G is counted as a pass.** 12 of the NET PASS records execute only as root; in the unprivileged run they skip and are reported as such.
+
+---
+
+# v0.2.4 EXTENSION — appended, nothing above modified
+
+Sections A–I are the v0.2.3 record and remain **byte-identical** to their state at `5bace07`.
+The SHA-256 of this file before this append was `6108d7b78ae896832653d32b0c644b656df58d951cae866d9fb88f608739e9c1`,
+which is also the hash of `git show 6b489ef:SECURITY_EVIDENCE_REGISTRY.md` — verified equal, so no historical
+row was touched. New evidence is added below, never substituted above.
+
+**v0.2.4 verified commit:** `067bdf0` · **Environment:** unchanged — `e2b.local`, Debian 12, kernel 6.1.158+,
+2 vCPU, 3939 MB, cgroup v2 (partial delegation), Landlock ABI 2, Python 3.11.2
+
+**Repro shorthand for this extension**
+- `SUITE24` = `/tmp/env4/bin/python -m pytest tests/ -q` → **360 passed / 39 skipped**
+- `QUAL`  = `scripts/skyla-host-qualify.sh check`
+- `FW_V`  = `sudo scripts/skyla-host-firewall.sh verify`
+- `MUT24` = `scripts/mutation_check.py <module> <description>` (the standing mutation harness)
+
+---
+
+## J. Complete egress re-verification (v0.2.4 mission M1)
+
+| ID | Claim | Impl | Test | Repro | Expected | Actual | Status |
+|---|---|---|---|---|---|---|---|
+| M1-01 | No gRPC, no vendor SDK, no `requests`/`aiohttp`/`urllib3` anywhere in `skyla/` | whole tree | grep scan | see `COMPLETE_EGRESS_REVIEW.md` §2 | zero matches | **zero matches** | **PASS** |
+| M1-02 | Exactly one outbound mechanism: `httpx` inside `egress_client` | `egress_client.py` | `test_no_client_is_issued_*` | `SUITE24` | no client constructed elsewhere | **zero constructions in application modules** | **PASS** |
+| M1-03 | Raw `socket` use is confined to the boundary probes and proxy listener | `perimeter.py`, `egress_client.py`, `egress.py`, `netguard.py` | manual review | grep in §2 | only those files | **only those files** | **PASS** |
+| M1-04 | Unknown capability resolves to `deny-all`; no wildcard policy | `egress.py` | `test_an_unknown_capability_gets_deny_all` | `python -c "policy_for_connector('x')"` | `deny-all`, no hosts | `deny-all`, `False`, no `*` | **PASS** |
+| M1-05 | Redirects never followed implicitly; each hop re-vetted | `research.py` | `test_the_client_is_bound_*` | `SUITE24` | `follow_redirects is False` | confirmed; `validate_url` per hop | **PASS** |
+| M1-06 | `local` execution provider inherits host network | `sandbox.py:31` | static review | — | should be namespace-isolated | **inherits host netns** | **FAIL** (EXEC-01, open) |
+
+### New findings in the verification machinery itself
+
+| ID | Finding | Why it matters | Fixed in |
+|---|---|---|---|
+| M1-07 | `perimeter.py` called `socket` without importing it → every host-control probe raised `NameError`, so control read as "no network" while the verdict still printed `isolated: True` | a proof that cannot fail is not a proof; two contradictory lines with the reassuring one winning | `067bdf0` |
+| M1-08 | `127.0.0.1:80` used as a control target; nothing listens there, so it failed regardless of policy | the control proved nothing | `067bdf0` |
+| M1-09 | `prove_no_egress` requires a working host control before reporting isolation | fail-closed proof | `067bdf0` |
+
+---
+
+## K. Host firewall (v0.2.4 mission M2 — NET-23)
+
+| ID | Claim | Impl | Test | Repro | Expected | Actual | Status |
+|---|---|---|---|---|---|---|---|
+| NET-23 | Host-wide default-deny egress, IPv4 **and** IPv6 | `scripts/skyla-host-firewall.sh` | `FW_V` | `sudo scripts/skyla-host-firewall.sh verify` | unauthorised blocked, exceptions work | `VERIFY: PASS` | **PASS** |
+| NET-24 | Unauthorised destinations are blocked | `SKYLA-EGRESS` chain | `FW_V` | same | pypi/github/TEST-NET blocked | all **blocked** | **PASS** |
+| NET-25 | Management/DNS/gateway exceptions remain usable | chain rules | `FW_V` | same | ssh + `1.1.1.1:53` + metadata reachable | reachable | **PASS** |
+| NET-26 | Policy survives reboot (persistence) | `/etc/skyla-firewall.v4`, systemd unit | simulated reboot | flush → `iptables-restore` | jump restored | `-A OUTPUT -j SKYLA-EGRESS` restored | **PASS** |
+| NET-27 | Rollback restores the prior state | `rollback` subcommand | manual | `rollback` | `OUTPUT ACCEPT`, pypi reachable | restored | **PASS** |
+| NET-28 | Automatic rollback fires if not confirmed | dead-man timer | `--safe-minutes` | armed then left to expire | policy reverts | **fired and reverted** (observed live) | **PASS** |
+| NET-29 | Activation refuses a chain lacking terminal DROP | `apply` guard | manual | build partial chain, attempt activate | refuse | refused | **PASS** |
+| NET-30 | Firewall + perimeter compose: both layers active simultaneously | both | live sweep | see `HOST_FIREWALL_DEPLOYMENT.md` §4 | authorised 200, wrong-capability denied | `research→pypi` **200**; `research→github` ProxyError; `research→metadata` **403**; `connector-google→pypi` ProxyError | **PASS** |
+| NET-31 | Host-level denial logging | — | — | — | denials logged | **no LOG/limit extension on this kernel** | **NOT VERIFIED** |
+| NET-32 | Firewall deployed on a second host | — | — | — | deployed elsewhere | **only this host** | **NOT VERIFIED** |
+
+---
+
+## L. Second host (v0.2.4 mission M3 — HOST-01)
+
+| ID | Claim | Impl | Test | Repro | Actual | Status |
+|---|---|---|---|---|---|---|
+| HOST-01 | Full qualification executed on a genuinely separate host | `scripts/skyla-host-qualify.sh` | `QUAL` then `run` | see `SECOND_HOST_FINAL_VALIDATION.md` | **no second host exists**; package runs correctly on this host | **NOT VERIFIED** |
+| HOST-02 | A reproducible qualification package exists and reports honestly | `scripts/skyla-host-qualify.sh` | `QUAL` | `scripts/skyla-host-qualify.sh check` | full capability report, non-zero on `MISSING` | **PASS** |
+| HOST-03 | Package detects kernel capability differences (not just binary presence) | `netns_usable` probe | `QUAL` | same | reports usability, not existence | **PASS** — reports `landlock_abi 2`, `delegated_subtree_exists: no` |
+
+---
+
+## M. Live connectors (v0.2.4 mission M4)
+
+| ID | Claim | Actual | Status |
+|---|---|---|---|
+| CONN-01 | Gmail live-verified (OAuth, messages, threads, drafts, controlled send, **revocation**) | **no credentials**; connector reports `mode=mock`, `live=False` | **NOT VERIFIED** |
+| CONN-02 | Calendar live-verified (availability, create, update, invite, conference link) | **no credentials**; `mode=mock` | **NOT VERIFIED** |
+| CONN-03 | Telegram live-verified (auth, delivery, command authorization, duplicate prevention) | **no credentials**; `mode=mock` | **NOT VERIFIED** |
+| CONN-04 | Connectors never report mock mode as live | `mode` / `live` populated correctly from absence of credentials | **PASS** |
+| CONN-05 | Validation harness refuses unsafe runs (test-mode ack, missing creds, wrong recipient) | 3 refusals each tested | **PASS** |
+| CONN-06 | Harness does not auto-send mail or auto-invite attendees | controlled send is an operator step; no invite path in harness | **PASS** |
+
+---
+
+## N. Test-suite accounting (v0.2.4 mission M6 — every skip explained)
+
+`SUITE24` = **360 passed / 39 skipped**. 36 skip *occurrences* appear in `-rs` because 4 tests share
+line 136. Distribution and production significance:
+
+| Count | File | Reason | Production significance |
+|---|---|---|---|
+| 18 | `test_cgroups.py` | `/sys/fs/cgroup/skyla` missing — delegation not bootstrapped | **Significant.** Memory/CPU/PID limits are unverified. A production host must run `scripts/cgroup_bootstrap.sh` as root or resource-exhaustion isolation is untested. |
+| 10 | `test_network_perimeter.py` | needs `CAP_SYS_ADMIN` to enter the namespace | **Significant but compensated.** The kernel-level properties were verified *manually as root* during M1/M2 (live process inspection, `nsenter` probes). The automated form cannot run unprivileged; the evidence exists in §J/§K, not in this run. |
+| 6 | `test_api_egress.py` | needs `CAP_SYS_ADMIN` | **Same as above** — compensated by the live sweep in §K NET-30. |
+| 2 | `test_egress.py` | host cannot reach pypi (host firewall now denies it) | **Not significant — expected.** These tests exercise real internet reachability; a correct default-deny firewall makes them impossible by design. The guard reports why rather than failing. |
+| 1 | `test_network_perimeter.py:302` | "perimeter is installed; the absent-namespace path cannot be exercised" | **Not significant.** Testing the *absence* handling requires the namespace to be absent; it currently exists. |
+| **39** | | | |
+
+**No skip is counted as a pass.** The 12 namespace-CAP skips are the only ones where a real control exists
+but the automated test cannot reach it; in both cases the control was verified manually and the manual
+evidence is recorded above with its command.
+
+---
+
+## O. Registry summary — v0.2.4
+
+Appended rows only. Historical totals (§I) are unchanged and still refer to `5bace07`.
+
+| Group | Records | PASS | FAIL | NOT VERIFIED |
+|---|---|---|---|---|
+| M1 (egress re-verification) | 9 | 8 | 1 (EXEC-01) | 0 |
+| NET (host firewall, v0.2.4) | 10 | 8 | 0 | 2 |
+| HOST (second host, v0.2.4) | 3 | 2 | 0 | 1 |
+| CONN (live connectors, v0.2.4) | 6 | 3 | 0 | 3 |
+| **v0.2.4 subtotal** | **28** | **21** | **1** | **6** |
+| Historical (v0.2.3, §I) | 81 | 73 | 0 | 6 (+2 PARTIAL) |
+| **Cumulative** | **109** | **94** | **1** | **12** (+2 PARTIAL) |
+
+### Changes versus the v0.2.3 gate
+
+| Item | v0.2.3 | v0.2.4 |
+|---|---|---|
+| NET-23 host firewall | **FAIL** | **PASS** (this host) |
+| NET-23 on second host | FAIL | **NOT VERIFIED** (reclassified: deployed here, unproven elsewhere) |
+| EXEC-01 `sandbox.py` host network | not recorded | **FAIL** (disclosed) |
+| HOST-01 | NOT VERIFIED | **NOT VERIFIED** |
+| CONN-01/02/03 | NOT VERIFIED | **NOT VERIFIED** |
+| External review | not performed | **not performed** (package ready) |
+| Suite | 359/37 | **360/39** |
+
+NET-23 moves from FAIL to PASS **for this host**. It does not move to PASS for production, because the
+release rule requires the firewall where the threat model demands it *and* second-host validation, and the
+second host is still missing.
