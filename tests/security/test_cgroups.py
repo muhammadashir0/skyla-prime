@@ -117,23 +117,61 @@ def test_peak_memory_respects_the_limit():
 
 # ------------------------------------------------------------------ pids (kernel)
 def test_pid_limit_is_enforced_by_the_kernel():
-    """Mutation: remove pids.max -> the loop forks far past 8."""
-    code = ("import os\nn=0\n"
-            "for _ in range(100):\n"
-            "    try:\n"
-            "        if os.fork()==0: os._exit(0)\n"
-            "        n+=1\n"
-            "    except OSError: break\n"
-            "print(n)")
-    rc, out, sample, exceeded = run_under_limit(code, JobLimits(memory_mb=128, pids=8))
-    forked = int(out.strip() or 0)
-    assert forked < 100, f"no PID limit: forked {forked}"
-    assert forked <= 8, f"forked {forked} with pids.max=8"
-    assert sample["pids_peak"] <= 8
-    assert exceeded.startswith("pids")
+    """pids.max bounds CONCURRENT tasks, not total forks over time.
+
+    Mutation: remove pids.max -> all 60 concurrent forks succeed -> FAIL.
+
+    Note (found by testing): a loop that forks and immediately reaps never trips
+    the limit, because only one child exists at a time. The earlier version of
+    this test asserted "forked < 8" and was therefore wrong in both directions --
+    it passed only because unreaped zombies happened to accumulate. The correct
+    assertion is on SIMULTANEOUS processes.
+    """
+    code = (
+        "import os, time, sys\n"
+        "kids=[]\n"
+        "try:\n"
+        "    for _ in range(60):\n"
+        "        pid=os.fork()\n"
+        "        if pid==0:\n"
+        "            time.sleep(5); os._exit(0)\n"
+        "        kids.append(pid)\n"
+        "except OSError:\n"
+        "    pass\n"
+        "print('simultaneous', len(kids))\n"
+        "for k in kids:\n"
+        "    try: os.kill(k, 9)\n"
+        "    except OSError: pass\n")
+    rc, out, sample, exceeded = run_under_limit(code, JobLimits(memory_mb=128, pids=8),
+                                                timeout=90)
+    line = [l for l in out.splitlines() if l.startswith("simultaneous")]
+    assert line, f"probe produced no output: {out!r} {sample}"
+    simultaneous = int(line[0].split()[1])
+    assert simultaneous < 60, f"pids.max not enforced: {simultaneous} concurrent processes"
+    assert simultaneous <= 8, f"{simultaneous} simultaneous processes with pids.max=8"
+    assert sample["pids_peak"] <= 8, f"pids.peak {sample['pids_peak']} exceeded pids.max"
 
 
-# ------------------------------------------------------------------- cpu (kernel)
+def test_pid_limit_counts_zombies():
+    """Documented kernel behaviour: an unreaped child still counts toward
+    pids.max. This is why a fork-and-reap loop does not trip the limit."""
+    code = (
+        "import os\n"
+        "n=0\n"
+        "for _ in range(60):\n"
+        "    try:\n"
+        "        pid=os.fork()\n"
+        "        if pid==0: os._exit(0)\n"
+        "        os.waitpid(pid,0)\n"
+        "        n+=1\n"
+        "    except OSError: break\n"
+        "print('reaped',n)\n")
+    rc, out, sample, _ = run_under_limit(code, JobLimits(memory_mb=128, pids=8))
+    reaped = int([l for l in out.splitlines() if l.startswith("reaped")][0].split()[1])
+    assert reaped == 60, (
+        f"a fork-and-reap loop should not be limited by pids.max, got {reaped}")
+
+
 def test_cpu_quota_throttles():
     """A 3 s spin under a 20% quota must be throttled per cpu.stat."""
     rc, out, _s, exceeded = run_under_limit(
@@ -283,3 +321,33 @@ def test_api_is_not_affected_by_a_runaway_workload():
     finally:
         job.kill()
         job.destroy()
+
+
+# ------------------------------------- cgroups reach the real API execution path
+def test_provider_run_is_placed_in_a_cgroup():
+    """The cgroup must be attached to the FINAL process, not just the unshare
+    parent. Regression: attaching the outer pid left the workload outside the
+    cgroup entirely (pids_peak=0), so the aggregate limit protected nothing."""
+    from skyla.execution.providers import NamespaceProvider
+    r = NamespaceProvider().run("print('cgroup probe')", timeout_s=30, memory_mb=256)
+    cg = r["controls"]["cgroup"]
+    assert cg["enabled"] is True, cg
+    assert cg["cgroup_v2"] is True, cg
+    assert r["controls"]["termination"] == "cgroup-kill+pid-namespace"
+    # The kernel's own peak counter proves the workload really was inside it.
+    assert cg["pids_peak"] >= 1, f"workload never entered the cgroup: {cg}"
+    assert cg["memory_peak_mb"] > 0, f"no memory accounted to the cgroup: {cg}"
+
+
+def test_provider_fork_storm_peak_is_bounded_by_pids_max():
+    from skyla.execution.providers import NamespaceProvider
+    code = ("import os\nn=0\n"
+            "for _ in range(60):\n"
+            "    try:\n"
+            "        if os.fork()==0: os._exit(0)\n"
+            "        n+=1\n"
+            "    except OSError: break\n"
+            "print('forked',n)")
+    r = NamespaceProvider().run(code, timeout_s=30, memory_mb=128)
+    cg = r["controls"]["cgroup"]
+    assert cg["pids_peak"] <= 26, f"pids.max not enforced: peak={cg['pids_peak']}"

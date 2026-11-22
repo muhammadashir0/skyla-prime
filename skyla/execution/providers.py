@@ -135,7 +135,8 @@ class NamespaceProvider(ExecutionProvider):
             s["error"] = str(exc)
         return s
 
-    def run(self, code, timeout_s=30, memory_mb=512, network=False) -> dict:
+    def run(self, code, timeout_s=30, memory_mb=512, network=False,
+            task_id: str = "") -> dict:
         from .workload import SupervisorUnavailable, run_isolated
         if network:
             # Approved-network execution is not implemented: refuse rather than
@@ -143,6 +144,35 @@ class NamespaceProvider(ExecutionProvider):
             return {"ok": False, "stdout": "", "returncode": -1,
                     "stderr": "Network-enabled execution is not supported by the "
                               "contained provider (deny by default)."}
+        # v0.2.2: wrap the run in an OS-enforced cgroup when available. The
+        # supervisor's rlimits remain the per-process backstop; the cgroup adds
+        # the aggregate ceiling and cgroup.kill tree termination. If cgroups are
+        # unavailable we still run (rlimits + namespaces are verified), but we say
+        # so in `controls` rather than implying kernel-level aggregate limits.
+        cg_status = {"cgroup_v2": False, "placement": False,
+                     "reason": "not attempted"}
+        job = None
+        try:
+            from .cgroups import (AggregateCapacityExceeded, CgroupUnavailable,
+                                  JobLimits, cgroup_governor)
+            cg_status = cgroup_governor.status()
+            if cg_status.get("cgroup_v2") and cg_status.get("placement"):
+                job = cgroup_governor.create_job(JobLimits(
+                    memory_mb=int(memory_mb),
+                    pids=24,
+                    cpu_quota_us=max(10_000, int(timeout_s) * 100_000 // 10),
+                    timeout_s=float(timeout_s)))
+            else:
+                cg_status["reason"] = cg_status.get("reason") or cg_status.get("placement_reason")
+        except AggregateCapacityExceeded as exc:
+            return {"ok": False, "stdout": "", "returncode": -1,
+                    "stderr": f"Execution refused: aggregate capacity ({exc})",
+                    "refused": True, "capacity_exceeded": True}
+        except CgroupUnavailable as exc:
+            cg_status = {"cgroup_v2": False, "placement": False, "reason": str(exc)}
+        except Exception as exc:                      # noqa: BLE001
+            cg_status = {"cgroup_v2": False, "placement": False, "reason": str(exc)}
+
         try:
             r = run_isolated(
                 code,
@@ -153,16 +183,36 @@ class NamespaceProvider(ExecutionProvider):
                 timeout_s=int(timeout_s),
                 sandbox_uid=65534,
                 sandbox_gid=65534,
+                cgroup=job,
             )
         except SupervisorUnavailable as exc:
             # FAIL CLOSED. No fallback provider, ever.
             return {"ok": False, "stdout": "", "returncode": -1,
                     "stderr": f"Execution refused: containment unavailable ({exc})",
                     "refused": True}
+        controls = dict(r.controls)
+        controls["cgroup"] = {
+            "enabled": job is not None,
+            "cgroup_v2": bool(cg_status.get("cgroup_v2")),
+            "placement": bool(cg_status.get("placement")),
+            "reason": cg_status.get("reason", ""),
+        }
+        if job is not None:
+            # Sample BEFORE reading the fields: peak counters only reflect the
+            # run once they have been read from the kernel after it finished.
+            job.sample()
+            controls["cgroup"].update({
+                "memory_peak_mb": job.peak_memory_mb,
+                "pids_peak": job.pids_peak,
+                "oom_kills": job.oom_kills,
+                "exceeded": job.exceeded(),
+            })
+            job.kill()
+            job.destroy()
         return {"ok": r.ok, "stdout": r.stdout, "stderr": r.stderr,
                 "returncode": r.returncode, "timed_out": r.timed_out,
                 "terminated": r.terminated, "processes_killed": r.processes_killed,
-                "controls": r.controls}
+                "controls": controls}
 
 
 def get_execution_provider() -> ExecutionProvider:

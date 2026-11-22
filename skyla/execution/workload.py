@@ -158,6 +158,7 @@ def run_isolated(
     timeout_s: int = 15,
     sandbox_uid: int = 65534,
     sandbox_gid: int = 65534,
+    cgroup=None,
 ) -> WorkloadResult:
     """Run Python inside the fully-contained supervisor.
 
@@ -202,10 +203,17 @@ def run_isolated(
             "mount -t tmpfs -o rw,size=64m,mode=1777 tmpfs {r}/tmp\n"
             "mount -t proc proc {r}/proc 2>/dev/null || true\n"
             "mount -t tmpfs -o ro,size=1m tmpfs {r}/dev\n"
+            "{join}"
             "exec {r}/skyla-sup {r} workspace /workspace/script.py "
             "{cpu} {mem} {fsize} {nproc} {uid} {gid}\n"
             .format(r=rootfs, ws=ws, cpu=cpu_s, mem=memory_mb, fsize=fsize_mb,
-                    nproc=nproc, uid=sandbox_uid, gid=sandbox_gid)
+                    nproc=nproc, uid=sandbox_uid, gid=sandbox_gid,
+                    # cgroup v2 refuses to migrate a process whose ancestors were
+                    # not migrated first, so the FINAL process must place ITSELF
+                    # in the job cgroup. Children then inherit it automatically
+                    # (verified: parent+child both in job, pids.peak=2).
+                    join=(f"echo $$ > {cgroup.path}/cgroup.procs\n"
+                          if cgroup is not None else ""))
         )
 
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/tmp"}
@@ -219,13 +227,35 @@ def run_isolated(
         except OSError as exc:
             raise SupervisorUnavailable(f"cannot start supervisor: {exc}") from exc
 
+        # Best-effort attach of the outer process. This does NOT cover the
+        # workload itself: unshare(1) forks, so this pid is the unshare parent and
+        # its children are migrated by `inner.sh` (self-placement) instead.
+        # Measured: attaching this pid alone left the real workload outside the
+        # cgroup, so the self-placement above is the load-bearing mechanism.
+        if cgroup is not None:
+            try:
+                cgroup.attach(proc.pid)
+            except Exception as exc:                       # noqa: BLE001
+                proc.kill()
+                proc.wait(timeout=10)
+                raise SupervisorUnavailable(
+                    f"cannot place workload in its cgroup: {exc}") from exc
+
         timed_out = False
         try:
             out, err = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
             out, err = "", ""
-            terminated, killed = terminate_and_verify(proc)
+            if cgroup is not None:
+                # cgroup.kill terminates the entire tree, including processes
+                # that escaped the process group via double-fork.
+                cg_ok, cg_killed = cgroup.kill()
+                terminated, killed = terminate_and_verify(proc)
+                terminated = terminated and cg_ok
+                killed = max(killed, cg_killed)
+            else:
+                terminated, killed = terminate_and_verify(proc)
             return WorkloadResult(
                 ok=False, stderr=f"Timed out after {timeout_s}s (workload tree terminated)",
                 returncode=-1, timed_out=True, terminated=terminated,
@@ -234,6 +264,10 @@ def run_isolated(
 
         # Normal completion: still verify nothing escaped (detached grandchildren).
         terminated, killed = terminate_and_verify(proc)
+        if cgroup is not None:
+            cg_ok, cg_killed = cgroup.kill()
+            terminated = terminated and cg_ok
+            killed = max(killed, cg_killed)
         return WorkloadResult(
             ok=proc.returncode == 0,
             stdout=(out or "")[-8000:], stderr=(err or "")[-8000:],
@@ -251,7 +285,7 @@ def _controls(cpu_s, memory_mb, fsize_mb, nproc, uid) -> dict:
         "seccomp": "allowlist",
         "landlock": "write-confined",
         "network": "disabled",
-        "termination": "pid-namespace-kill",
+        "termination": "cgroup-kill+pid-namespace",
     }
 
 
